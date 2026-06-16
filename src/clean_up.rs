@@ -16,7 +16,7 @@ impl OpLogWorker {
 }
 
 impl LogDefinition {
-    pub fn clean_up(&mut self) {
+    fn clean_up(&mut self) {
         self.files.retain(|_, f| {
             !f.logs.is_empty() || f.last_time_use.elapsed() < Duration::from_secs(10 * 60)
         });

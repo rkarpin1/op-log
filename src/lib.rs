@@ -27,38 +27,38 @@ use tokio::time::Instant;
 // Internal worker types
 // -------------------------------------------------------------------------------------------------
 
-pub(crate) struct LogDefinition {
-    pub(crate) last_time_use: Instant,
-    pub(crate) header: String,
-    pub(crate) path: String,
-    pub(crate) flush_interval: Duration,
-    pub(crate) log_type: OpLogType,
-    pub(crate) options: HashSet<OpLogOption>,
-    pub(crate) files: HashMap<String, LogFile>,
+struct LogDefinition {
+    last_time_use: Instant,
+    header: String,
+    path: String,
+    flush_interval: Duration,
+    log_type: OpLogType,
+    options: HashSet<OpLogOption>,
+    files: HashMap<String, LogFile>,
 }
 
-pub(crate) struct LogFile {
-    pub(crate) last_time_use: Instant,
-    pub(crate) time_of_first_addition_of_log_after_write: Option<Instant>,
-    pub(crate) log_name: String,
-    pub(crate) header: String,
-    pub(crate) path: String,
-    pub(crate) logs: VecDeque<String>,
+struct LogFile {
+    last_time_use: Instant,
+    time_of_first_addition_of_log_after_write: Option<Instant>,
+    log_name: String,
+    header: String,
+    path: String,
+    logs: VecDeque<String>,
 }
 
-pub(crate) struct LogCleanUpDefinition {
-    pub(crate) path: String,
-    pub(crate) delete_after_days: u32,
+struct LogCleanUpDefinition {
+    path: String,
+    delete_after_days: u32,
 }
 
-pub(crate) struct OpLogWorker {
-    pub(crate) definitions: HashMap<String, LogDefinition>,
-    pub(crate) clean_up_definitions: Vec<LogCleanUpDefinition>,
-    pub(crate) rx_channel: Receiver<OpLogMessage>,
+struct OpLogWorker {
+    definitions: HashMap<String, LogDefinition>,
+    clean_up_definitions: Vec<LogCleanUpDefinition>,
+    rx_channel: Receiver<OpLogMessage>,
 }
 
 impl OpLogWorker {
-    pub(crate) fn new(rx: Receiver<OpLogMessage>) -> OpLogWorker {
+    fn new(rx: Receiver<OpLogMessage>) -> OpLogWorker {
         OpLogWorker {
             definitions: HashMap::new(),
             clean_up_definitions: Vec::new(),
@@ -173,12 +173,12 @@ mod tests {
         let op = OpLog::new();
         let op2 = op.clone();
 
-        let mut def = OpLogDefinition::new("integration", ".");
+        let mut def = OpLogDefinition::new("test", ".");
         def.log_type(OpLogType::PerHour);
         def.flush_interval(Duration::from_secs(60));
         op.def(def);
 
-        op2.log("integration", Utc::now(), "test log from clone");
+        op2.log("test", Utc::now(), "test log from clone");
         op.flush();
 
         let info = op.get_info().await;

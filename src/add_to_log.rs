@@ -123,7 +123,7 @@ impl LogDefinition {
         }
     }
 
-    pub fn add_to_log(&mut self, log_name: String, path: String, header: String, log: String) {
+    fn add_to_log(&mut self, log_name: String, path: String, header: String, log: String) {
         let log_file = self.get_log_file(log_name, path, header);
 
         log_file.last_time_use = Instant::now();
