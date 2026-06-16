@@ -5,7 +5,7 @@ An async file logging library for Rust built on Tokio. Log entries are compresse
 ## Features
 
 - Async I/O via Tokio
-- Message-passing via `mpsc` channel — thread-safe by design
+- Thread-safe `OpLog` handle — clone freely, all clones share one background worker
 - zlib compression + lightweight XOR obfuscation of stored data
 - Automatic log file splitting by time period: hour, day, month, or no split
 - Optional subdirectories per period (`UseSubDirectories`)
@@ -25,69 +25,60 @@ tokio = { version = "1", features = ["full"] }
 
 ## Quick start
 
-`op-log` works through a message channel. Spawn the worker in the background and send commands to it.
+Create an `OpLog` handle — the background worker is spawned automatically. The handle is cheaply cloneable; all clones share the same worker.
 
 ```rust
-use op_log::messages::{
-    OpLogBundle, OpLogData, OpLogDefinition, OpLogMessage, OpLogOption, OpLogType,
-};
+use op_log::{OpLog, OpLogDefinition, OpLogType};
 use chrono::Utc;
-use std::collections::HashSet;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = mpsc::channel::<OpLogMessage>(1024);
-
-    // Spawn the worker in the background
-    tokio::spawn(async move {
-        let mut worker = op_log::OpLogWorker::new(rx);
-        worker.run().await;
-    });
+    let log = OpLog::new();
 
     // Register a log definition
-    let mut def = OpLogDefinition::new("app", "./logs");
-    def.log_type(OpLogType::PerDay)
-       .flush_interval(Duration::from_secs(1))
-       .header("timestamp, message");
+    let def = OpLogDefinition::new("app", "./logs")
+        .log_type(OpLogType::PerDay)
+        .flush_interval(Duration::from_secs(1))
+        .header("timestamp, message");
 
-    tx.send(OpLogMessage::LogDefinition(def)).await.unwrap();
+    log.def(def)
+       .log("app", Utc::now(), "application started");
 
-    // Write a log entry
-    tx.send(OpLogMessage::Log(OpLogData {
-        log_name: "app".to_string(),
-        log: "application started".to_string(),
-        date: Utc::now(),
-    })).await.unwrap();
-
-    // Stop the service
-    tx.send(OpLogMessage::StopService).await.unwrap();
+    // Flush and shut down, waiting for pending writes to complete
+    log.shutdown().await;
 }
 ```
 
-## Messages (`OpLogMessage`)
+## API (`OpLog`)
 
-| Message | Description |
+| Method | Description |
 |---|---|
-| `LogDefinition(OpLogDefinition)` | Registers or updates a log definition |
-| `Log(OpLogData)` | Appends a single entry to a log |
-| `LogBundle(OpLogBundle)` | Batch: definitions + entries in one message |
-| `Flush` | Forces all buffered logs to be written to disk |
-| `GetInfoAndFlush(sender)` | Returns stats and performs a flush |
-| `StopService` | Flushes and shuts down the worker |
-| `CleanUpDefinition(...)` | Adds a rule for deleting old files |
-| `CleanUpBundle(...)` | Replaces the full set of cleanup rules |
-| `CleanUpRemoveAllDefinitions` | Removes all cleanup rules |
+| `OpLog::new()` | Spawns the background worker and returns a handle |
+| `def(OpLogDefinition)` | Registers or updates a log definition |
+| `log(name, date, text)` | Appends a single entry to a log |
+| `log_bundle(OpLogBundle)` | Batch: definitions + entries in one call |
+| `flush()` | Signals the worker to flush pending writes (fire-and-forget) |
+| `get_info()` | Flushes and returns current stats (`Option<OpLogInfo>`) |
+| `shutdown()` | Flushes, shuts down the worker, and waits for it to finish |
+| `clean_up_definition(def)` | Registers or updates a cleanup rule for a log path |
+| `clean_up_bundle(rules)` | Replaces the full set of cleanup rules at once |
+| `clean_up_remove_all_definitions()` | Removes all cleanup rules |
+
+All methods except `get_info` and `shutdown` are non-blocking and return `&OpLog` for chaining.
 
 ## Log configuration (`OpLogDefinition`)
 
 ```rust
-let mut def = OpLogDefinition::new("my_log", "/path/to/logs");
-def.log_type(OpLogType::PerDay)
-   .flush_interval(Duration::from_secs(2))
-   .header("col1, col2, col3")
-   .options(HashSet::from([OpLogOption::UseSubDirectories]));
+use op_log::{OpLogDefinition, OpLogType, OpLogOption};
+use std::collections::HashSet;
+use std::time::Duration;
+
+let def = OpLogDefinition::new("my_log", "/path/to/logs")
+    .log_type(OpLogType::PerDay)
+    .flush_interval(Duration::from_secs(2))
+    .header("col1, col2, col3")
+    .options(HashSet::from([OpLogOption::UseSubDirectories]));
 ```
 
 ### File split types (`OpLogType`)
@@ -103,18 +94,18 @@ def.log_type(OpLogType::PerDay)
 
 | Option | Description |
 |---|---|
-| `UseSubDirectories` | Groups files in subdirectories by period instead of using a name suffix |
+| `UseSubDirectories` | Groups files in subdirectories by period instead of a name suffix |
 | `NoAddDateToLog` | Does not prepend a timestamp to each log entry |
 
 ## Automatic file cleanup
 
 ```rust
-use op_log::messages::{OpLogCleanUpDefinition, OpLogMessage};
+use op_log::OpLogCleanUpDefinition;
 
-tx.send(OpLogMessage::CleanUpDefinition(OpLogCleanUpDefinition {
+log.clean_up_definition(OpLogCleanUpDefinition {
     path: "./logs".to_string(),
     delete_after_days: 30,
-})).await.unwrap();
+});
 ```
 
 The worker runs cleanup every 5 minutes, deleting files (and empty directories) older than the specified number of days.
