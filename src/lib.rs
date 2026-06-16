@@ -4,16 +4,16 @@
 
 mod add_to_log;
 mod clean_up;
+mod clean_up_delete_files;
 pub mod messages;
 mod service;
 mod write_to_file;
-mod clean_up_delete_files;
 
+use crate::messages::OpLogMessage;
 pub use crate::messages::{
     OpLogBundle, OpLogCleanUpDefinition, OpLogData, OpLogDefinition, OpLogInfo, OpLogOption,
     OpLogType,
 };
-use crate::messages::OpLogMessage;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -97,27 +97,32 @@ impl OpLog {
     }
 
     /// Registers a log definition. Non-blocking; drops silently if the channel is full.
-    pub fn def(&self, def: OpLogDefinition) {
+    pub fn def(&self, def: OpLogDefinition) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::LogDefinition(def));
+        self
     }
 
     /// Sends a log entry. Non-blocking; drops silently if the channel is full.
-    pub fn log(&self, name: &str, date: DateTime<Utc>, text: &str) {
+    pub fn log(&self, name: &str, date: DateTime<Utc>, text: &str) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::Log(OpLogData {
             log_name: name.to_string(),
             log: text.to_string(),
             date,
         }));
+
+        self
     }
 
     /// Sends a bundle of definitions and log entries atomically.
-    pub fn log_bundle(&self, bundle: OpLogBundle) {
+    pub fn log_bundle(&self, bundle: OpLogBundle) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::LogBundle(bundle));
+        self
     }
 
     /// Signals the worker to flush pending writes. Fire-and-forget.
-    pub fn flush(&self) {
+    pub fn flush(&self) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::Flush);
+        self
     }
 
     /// Flushes pending writes and returns current stats.
@@ -138,21 +143,24 @@ impl OpLog {
     }
 
     /// Registers or updates a cleanup rule for a log path.
-    pub fn clean_up_definition(&self, def: OpLogCleanUpDefinition) {
+    pub fn clean_up_definition(&self, def: OpLogCleanUpDefinition) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::CleanUpDefinition(def));
+        self
     }
 
     /// Replaces all cleanup rules at once.
-    pub fn clean_up_bundle(&self, bundle: Vec<OpLogCleanUpDefinition>) {
+    pub fn clean_up_bundle(&self, bundle: Vec<OpLogCleanUpDefinition>) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::CleanUpBundle(bundle));
+        self
     }
 
     /// Removes all registered cleanup rules.
-    pub fn clean_up_remove_all_definitions(&self) {
+    pub fn clean_up_remove_all_definitions(&self) -> &OpLog {
         let _ = self
             .0
             .tx
             .try_send(OpLogMessage::CleanUpRemoveAllDefinitions);
+        self
     }
 }
 
