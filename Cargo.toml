@@ -1,3 +1,5 @@
+# cargo update; cargo upgrade
+
 [package]
 name = "op-log"
 version = "0.2.0"
