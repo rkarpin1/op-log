@@ -47,27 +47,27 @@ impl OpLogDefinition {
         }
     }
 
-    pub fn header(&mut self, header: &str) -> &mut OpLogDefinition {
+    pub fn header(mut self, header: &str) -> OpLogDefinition {
         self.header = header.to_string();
         self
     }
 
-    pub fn log_type(&mut self, log_type: OpLogType) -> &mut OpLogDefinition {
+    pub fn log_type(mut self, log_type: OpLogType) -> OpLogDefinition {
         self.log_type = log_type;
         self
     }
 
-    pub fn options(&mut self, options: HashSet<OpLogOption>) -> &mut OpLogDefinition {
+    pub fn options(mut self, options: HashSet<OpLogOption>) -> OpLogDefinition {
         self.options = options;
         self
     }
 
-    pub fn flush_interval(&mut self, timeout: Duration) -> &mut OpLogDefinition {
+    pub fn flush_interval(mut self, timeout: Duration) -> OpLogDefinition {
         self.flush_interval = timeout;
         self
     }
 
-    pub fn path(&mut self, path: &str) -> &mut OpLogDefinition {
+    pub fn path(mut self, path: &str) -> OpLogDefinition {
         self.path = path.to_string();
         self
     }

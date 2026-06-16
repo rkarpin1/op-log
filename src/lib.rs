@@ -120,9 +120,8 @@ impl OpLog {
     }
 
     /// Signals the worker to flush pending writes. Fire-and-forget.
-    pub fn flush(&self) -> &OpLog {
+    pub fn flush(&self) {
         let _ = self.0.tx.try_send(OpLogMessage::Flush);
-        self
     }
 
     /// Flushes pending writes and returns current stats.
@@ -179,12 +178,14 @@ mod tests {
     #[tokio::test]
     async fn user_facing_api() {
         let op = OpLog::new();
-        let op2 = op.clone();
 
-        let mut def = OpLogDefinition::new("test", ".");
-        def.log_type(OpLogType::PerHour);
-        def.flush_interval(Duration::from_secs(60));
+        let def = OpLogDefinition::new("test", ".")
+            .log_type(OpLogType::PerHour)
+            .flush_interval(Duration::from_secs(60));
+
         op.def(def);
+
+        let op2 = op.clone();
 
         op2.log("test", Utc::now(), "test log from clone");
         op.flush();
