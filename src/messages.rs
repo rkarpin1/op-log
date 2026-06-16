@@ -89,6 +89,16 @@ impl OpLogBundle {
     pub fn new() -> OpLogBundle {
         Default::default()
     }
+
+    pub fn add_definition(mut self, def: OpLogDefinition) -> OpLogBundle {
+        self.definitions.push(def);
+        self
+    }
+
+    pub fn add_log(mut self, log: OpLogData) -> OpLogBundle {
+        self.logs.push(log);
+        self
+    }
 }
 
 pub struct OpLogCleanUpDefinition {

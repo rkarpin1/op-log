@@ -24,6 +24,34 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 // -------------------------------------------------------------------------------------------------
+// log crate integration
+// -------------------------------------------------------------------------------------------------
+
+struct OpLogSystemLogger {
+    inner: std::sync::Arc<OpLogInner>,
+    name: String,
+}
+
+impl log::Log for OpLogSystemLogger {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        let text = format!("[{}] {}", record.level(), record.args());
+        let _ = self.inner.tx.try_send(OpLogMessage::Log(OpLogData {
+            log_name: self.name.clone(),
+            log: text,
+            date: Utc::now(),
+        }));
+    }
+
+    fn flush(&self) {
+        let _ = self.inner.tx.try_send(OpLogMessage::Flush);
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // Internal worker types
 // -------------------------------------------------------------------------------------------------
 
@@ -99,6 +127,26 @@ impl OpLog {
     /// Registers a log definition. Non-blocking; drops silently if the channel is full.
     pub fn def(&self, def: OpLogDefinition) -> &OpLog {
         let _ = self.0.tx.try_send(OpLogMessage::LogDefinition(def));
+        self
+    }
+
+    /// Registers a log definition and installs `OpLog` as the global `log` crate logger.
+    /// After this call, macros such as `info!`, `warn!`, and `error!` route their output
+    /// to `OpLog::log` using `def.log_name` as the log name.
+    /// If a global logger is already set this call is a no-op for the logger part but still
+    /// registers the definition.
+    pub fn def_system_log(&self, def: OpLogDefinition) -> &OpLog {
+        let name = def.log_name.clone();
+        self.def(def);
+
+        let logger = Box::new(OpLogSystemLogger {
+            inner: self.0.clone(),
+            name,
+        });
+        if log::set_logger(Box::leak(logger)).is_ok() {
+            log::set_max_level(log::LevelFilter::Trace);
+        }
+
         self
     }
 
@@ -197,5 +245,31 @@ mod tests {
 
         // second shutdown call must be a no-op (idempotent)
         op2.shutdown().await;
+    }
+
+    // One test covers both: definition registration and log routing via info!.
+    // Merging avoids the constraint that log::set_logger can be called only once per process —
+    // a second def_system_log call in the same process would install on a dead OpLog.
+    #[tokio::test]
+    async fn def_system_log_registers_definition_and_routes_log() {
+        let op = OpLog::new();
+
+        op.def_system_log(
+            OpLogDefinition::new("log",".")
+                .log_type(OpLogType::PerHour)
+                .flush_interval(Duration::from_secs(60)),
+        );
+
+        log::info!("hello from info! macro");
+
+        // Give the async worker time to dequeue the channel message.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // get_info captures number_of_logs before it flushes to disk.
+        let info = op.get_info().await.unwrap();
+        assert_eq!(info.number_of_definitions, 1);
+        assert!(info.number_of_logs >= 1, "info! must route to OpLog");
+
+        op.shutdown().await;
     }
 }
