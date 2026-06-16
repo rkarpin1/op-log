@@ -1,0 +1,223 @@
+// -------------------------------------------------------------------------------------------------
+//   Copyright 2024-2025 (c) Robert Karpiński
+// -------------------------------------------------------------------------------------------------
+
+use crate::messages::OpLogInfo;
+use crate::{LogDefinition, LogFile, OpLogWorker};
+use bytes::{BufMut, BytesMut};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use rand::random;
+use std::io;
+use std::io::prelude::*;
+use std::path::PathBuf;
+use std::time::Duration;
+use log::info;
+use tokio::fs;
+use tokio::fs::{create_dir_all, File};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
+
+impl LogDefinition {
+    async fn write_to_file(&mut self, flush_interval: &Duration) {
+        for file in self.files.values_mut() {
+            file.write_to_file(flush_interval).await.unwrap()
+        }
+    }
+
+    fn log_count(&self) -> usize {
+        self.files.values().map(|f| f.log_count()).sum()
+    }
+}
+
+impl OpLogWorker {
+    fn log_count(&self) -> usize {
+        self.definitions.values().map(|def| def.log_count()).sum()
+    }
+
+    pub(crate) async fn write_to_files(&mut self) {
+        for def in self.definitions.values_mut() {
+            let flush_interval = def.flush_interval;
+            def.write_to_file(&flush_interval).await
+        }
+    }
+
+    pub(crate) async fn get_info_and_flush(&mut self, sender: oneshot::Sender<OpLogInfo>) {
+        let info = OpLogInfo {
+            number_of_definitions: self.definitions.len(),
+            number_of_logs: self.log_count(),
+        };
+
+        self.flush().await;
+
+        let _ = sender.send(info);
+    }
+
+    pub(crate) async fn flush(&mut self) {
+        info!(target: "opLog", "flush()");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        loop {
+            for def in self.definitions.values_mut() {
+                def.write_to_file(&Duration::from_millis(0)).await
+            }
+
+            if self.log_count() == 0 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+}
+
+impl LogFile {
+    async fn write_to_file(&mut self, flush_interval: &Duration) -> io::Result<()> {
+        if self.logs.is_empty() {
+            self.time_of_first_addition_of_log_after_write = None;
+            return Ok(());
+        }
+
+        if let Some(time) = self.time_of_first_addition_of_log_after_write {
+            let diff = time.elapsed();
+            if diff < *flush_interval {
+                return Ok(());
+            }
+        }
+
+        let mut bytes = BytesMut::with_capacity(1024);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+
+        let mut path = PathBuf::from(&self.path);
+        let _ = create_dir_all(&path).await;
+
+        path.push(&self.log_name);
+
+        let mut f = if fs::metadata(&path).await.is_ok() {
+            File::options().append(true).open(&path).await?
+        } else {
+            let mut f = File::create(&path).await?;
+
+            f.write_all(b"OPLog 1.0\n").await?;
+
+            if !self.header.is_empty() {
+                bytes.put(self.header.as_bytes());
+                bytes.put_u8(0x0a);
+
+                encoder.write_all(&bytes)?;
+                bytes.clear();
+            }
+
+            f
+        };
+
+        loop {
+            bytes.clear();
+
+            loop {
+                if self.logs.is_empty() {
+                    break;
+                }
+                let log = self.logs.pop_front().unwrap();
+                bytes.put(log.as_bytes());
+                bytes.put_u8(0x0a);
+
+                if bytes.len() > 64000 {
+                    break;
+                }
+            }
+
+            if bytes.is_empty() {
+                break;
+            }
+            let b = bytes.split();
+
+            encoder.write_all(&b)?;
+            if encoder.get_ref().len() > 2 * 1024 * 1024 {
+                break;
+            }
+        }
+
+        let mut a = encoder.finish()?;
+        let mut size = a.len();
+
+        let rnd: u8 = random();
+
+        let mut sum = 0u32;
+        let mut xor: u32 = (rnd as u32 * size as u32) & 0xFFF;
+
+        // encrypt
+        for byte in a.iter_mut() {
+            sum += *byte as u32;
+            sum &= 0xff;
+
+            xor *= 2903;
+            xor += 71;
+
+            xor &= 0xfff;
+
+            *byte ^= (xor & 0xff) as u8;
+        }
+
+        bytes.clear();
+        bytes.put_u8(0xff);
+        bytes.put_u8(rnd);
+        bytes.put_u8((sum as u8) ^ 0x5c);
+
+        loop {
+            let mut a: u8 = (size & 0x7F) as u8;
+            size >>= 7;
+            if size != 0 {
+                a |= 0x80
+            };
+
+            bytes.put_u8(a ^ 0xc5);
+            if size == 0 {
+                break;
+            }
+        }
+
+        f.write_all(&bytes).await?;
+        f.write_all(&a).await?;
+        f.flush().await?;
+
+        if self.logs.is_empty() {
+            self.time_of_first_addition_of_log_after_write = None;
+        }
+
+        Ok(())
+    }
+
+    fn log_count(&self) -> usize {
+        self.logs.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::OpLogWorker;
+    use crate::messages::OpLogType;
+    use chrono::Utc;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn write_to_file() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(32);
+        let mut op_log = OpLogWorker::new(rx);
+
+        op_log.def(
+            "test",
+            ".",
+            OpLogType::PerHour,
+            &HashSet::new(),
+            Duration::from_secs(10),
+            "header, jest długi bez z półskimi liter ŻĄŁ",
+        );
+
+        op_log.log("test", Utc::now(), "log, to ładny i ŻAŁOŚĆ to słowo");
+
+        let c = op_log.log_count();
+        println!("{}", c);
+        op_log.flush().await;
+    }
+}
