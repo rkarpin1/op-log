@@ -38,6 +38,11 @@ impl log::Log for OpLogSystemLogger {
     }
 
     fn log(&self, record: &log::Record<'_>) {
+
+        if record.level() > log::Level::Info {
+            return;
+        }
+
         let text = format!("[{}] {}", record.level(), record.args());
         let _ = self.inner.tx.try_send(OpLogMessage::Log(OpLogData {
             log_name: self.name.clone(),
@@ -256,7 +261,7 @@ mod tests {
         let op = OpLog::new();
 
         op.def_system_log(
-            OpLogDefinition::new("log",".")
+            OpLogDefinition::new("log", ".")
                 .log_type(OpLogType::PerHour)
                 .flush_interval(Duration::from_secs(60)),
         );
