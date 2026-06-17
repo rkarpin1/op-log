@@ -33,6 +33,7 @@ pub struct OpLogDefinition {
     pub path: String,
     pub options: HashSet<OpLogOption>,
     pub flush_interval: Duration,
+    pub auto_remove_definition: bool,
 }
 
 impl OpLogDefinition {
@@ -44,6 +45,7 @@ impl OpLogDefinition {
             header: "".to_string(),
             options: HashSet::new(),
             flush_interval: Duration::from_secs(1),
+            auto_remove_definition: false,
         }
     }
 
@@ -69,6 +71,11 @@ impl OpLogDefinition {
 
     pub fn path(mut self, path: &str) -> OpLogDefinition {
         self.path = path.to_string();
+        self
+    }
+
+    pub fn auto_remove_definition(mut self, enabled: bool) -> OpLogDefinition {
+        self.auto_remove_definition = enabled;
         self
     }
 }

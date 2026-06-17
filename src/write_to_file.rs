@@ -212,6 +212,7 @@ mod tests {
             &HashSet::new(),
             Duration::from_secs(10),
             "header, jest długi bez z półskimi liter ŻĄŁ",
+            false
         );
 
         op_log.log("test", Utc::now(), "log, to ładny i ŻAŁOŚĆ to słowo");

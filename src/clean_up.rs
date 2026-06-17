@@ -10,7 +10,8 @@ impl OpLogWorker {
         self.definitions.values_mut().for_each(|d| d.clean_up());
 
         self.definitions.retain(|_, d| {
-            !d.files.is_empty() || d.last_time_use.elapsed() < Duration::from_secs(10 * 60)
+            d.auto_remove_definition &&
+                (!d.files.is_empty() || d.last_time_use.elapsed() < Duration::from_secs(10 * 60))
         });
     }
 }

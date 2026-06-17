@@ -60,6 +60,7 @@ impl OpLogWorker {
             &def.options,
             def.flush_interval,
             def.header.as_str(),
+            def.auto_remove_definition,
         )
     }
 

@@ -57,6 +57,7 @@ impl log::Log for OpLogSystemLogger {
 
 struct LogDefinition {
     last_time_use: Instant,
+    auto_remove_definition: bool,
     header: String,
     path: String,
     flush_interval: Duration,

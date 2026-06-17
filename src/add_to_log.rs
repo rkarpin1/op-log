@@ -37,6 +37,7 @@ impl OpLogWorker {
         options: &HashSet<OpLogOption>,
         flush_interval: Duration,
         header: &str,
+        auto_remove_definition: bool,
     ) {
         match self.definitions.entry(log_name.to_string()) {
             Entry::Occupied(mut e) => {
@@ -49,6 +50,7 @@ impl OpLogWorker {
             Entry::Vacant(e) => {
                 e.insert(LogDefinition {
                     last_time_use: Instant::now(),
+                    auto_remove_definition,
                     path: path.to_string(),
                     flush_interval,
                     log_type,
