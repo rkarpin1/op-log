@@ -16,6 +16,12 @@ impl OpLogWorker {
 
         loop {
             tokio::select! {
+                biased;
+                _ = writer_tick.tick() => self.write_to_files().await,
+                _ = cleanup_tick.tick() => {
+                    self.clean_up();
+                    self.clean_up_delete_files().await;
+                }
                 msg = self.rx_channel.recv() => {
                     match msg {
                         None => break,
@@ -31,11 +37,6 @@ impl OpLogWorker {
                         Some(OpLogMessage::CleanUpDefinition(def)) => self.clean_up_definition(def),
                         Some(OpLogMessage::CleanUpBundle(bundle)) => self.clean_up_bundle(bundle),
                     }
-                }
-                _ = writer_tick.tick() => self.write_to_files().await,
-                _ = cleanup_tick.tick() => {
-                    self.clean_up();
-                    self.clean_up_delete_files().await;
                 }
             }
         }
