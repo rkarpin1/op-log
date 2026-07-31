@@ -17,6 +17,7 @@ pub use crate::messages::{
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
@@ -44,11 +45,11 @@ impl log::Log for OpLogSystemLogger {
         }
 
         let text = format!("[{}] {}", record.level(), record.args());
-        let _ = self.inner.tx.try_send(OpLogMessage::Log(OpLogData {
+        self.inner.send_log(OpLogData {
             log_name: self.name.clone(),
             log: text,
             date: Utc::now(),
-        }));
+        });
     }
 
     fn flush(&self) {
@@ -78,6 +79,9 @@ struct LogFile {
     header: String,
     path: String,
     logs: VecDeque<String>,
+    /// True after a failed disk write was reported — keeps the error message
+    /// to one per failure episode instead of one per writer tick.
+    write_error_logged: bool,
 }
 
 struct LogCleanUpDefinition {
@@ -105,9 +109,40 @@ impl OpLogWorker {
 // User-facing handle
 // -------------------------------------------------------------------------------------------------
 
+/// Capacity of the worker channel. Shared by every log the process writes;
+/// bursts of large entries from several concurrent producers can outpace the
+/// worker while it is busy with disk I/O — a too-small buffer silently drops
+/// entries.
+const CHANNEL_CAPACITY: usize = 1024;
+
 struct OpLogInner {
     tx: Sender<OpLogMessage>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// Log entries dropped because the channel was full; reported back into
+    /// the log as a notice entry on the next successful send.
+    dropped_logs: AtomicU64,
+}
+
+impl OpLogInner {
+    /// Sends a log entry. A full channel does not lose entries silently:
+    /// drops are counted and a notice entry is written to the same log once
+    /// the channel has room again.
+    fn send_log(&self, data: OpLogData) {
+        let pending = self.dropped_logs.swap(0, Ordering::Relaxed);
+        if pending > 0 {
+            let notice = OpLogMessage::Log(OpLogData {
+                log_name: data.log_name.clone(),
+                log: format!("[op-log] dropped {pending} log entries (channel full)"),
+                date: data.date,
+            });
+            if self.tx.try_send(notice).is_err() {
+                self.dropped_logs.fetch_add(pending, Ordering::Relaxed);
+            }
+        }
+        if self.tx.try_send(OpLogMessage::Log(data)).is_err() {
+            self.dropped_logs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Thread-safe handle to the OpLog background worker.
@@ -118,7 +153,7 @@ pub struct OpLog(std::sync::Arc<OpLogInner>);
 impl OpLog {
     /// Spawns the background worker. Must be called inside a Tokio runtime.
     pub fn new() -> OpLog {
-        let (tx, rx) = mpsc::channel::<OpLogMessage>(32);
+        let (tx, rx) = mpsc::channel::<OpLogMessage>(CHANNEL_CAPACITY);
         let worker = OpLogWorker::new(rx);
         let handle = tokio::spawn(async move {
             let mut w = worker;
@@ -127,6 +162,7 @@ impl OpLog {
         OpLog(std::sync::Arc::new(OpLogInner {
             tx,
             handle: Mutex::new(Some(handle)),
+            dropped_logs: AtomicU64::new(0),
         }))
     }
 
@@ -156,13 +192,15 @@ impl OpLog {
         self
     }
 
-    /// Sends a log entry. Non-blocking; drops silently if the channel is full.
+    /// Sends a log entry. Non-blocking; if the channel is full the entry is
+    /// dropped, but the drop is counted and reported into the log as a
+    /// notice entry once the channel has room again.
     pub fn log(&self, name: &str, date: DateTime<Utc>, text: &str) -> &OpLog {
-        let _ = self.0.tx.try_send(OpLogMessage::Log(OpLogData {
+        self.0.send_log(OpLogData {
             log_name: name.to_string(),
             log: text.to_string(),
             date,
-        }));
+        });
 
         self
     }
@@ -251,6 +289,47 @@ mod tests {
 
         // second shutdown call must be a no-op (idempotent)
         op2.shutdown().await;
+    }
+
+    // Exercises send_log directly against a tiny channel with no worker:
+    // overflow is counted, and the first send after the channel has room
+    // emits a notice entry carrying the dropped count.
+    #[tokio::test]
+    async fn send_log_counts_drops_and_reports_notice() {
+        let (tx, mut rx) = mpsc::channel::<OpLogMessage>(1);
+        let inner = OpLogInner {
+            tx,
+            handle: Mutex::new(None),
+            dropped_logs: AtomicU64::new(0),
+        };
+        let entry = |text: &str| OpLogData {
+            log_name: "test".to_string(),
+            log: text.to_string(),
+            date: Utc::now(),
+        };
+
+        // capacity 1: first fills the channel, next two are dropped and counted
+        inner.send_log(entry("1"));
+        inner.send_log(entry("2"));
+        inner.send_log(entry("3"));
+        assert_eq!(inner.dropped_logs.load(Ordering::Relaxed), 2);
+
+        // drain one slot: the next send spends it on the notice entry,
+        // so the fresh entry is dropped and counted again
+        let first = rx.recv().await.unwrap();
+        match first {
+            OpLogMessage::Log(data) => assert_eq!(data.log, "1"),
+            _ => panic!("expected a Log message"),
+        }
+        inner.send_log(entry("4"));
+        let notice = rx.recv().await.unwrap();
+        match notice {
+            OpLogMessage::Log(data) => {
+                assert_eq!(data.log, "[op-log] dropped 2 log entries (channel full)")
+            }
+            _ => panic!("expected a Log message"),
+        }
+        assert_eq!(inner.dropped_logs.load(Ordering::Relaxed), 1);
     }
 
     // One test covers both: definition registration and log routing via info!.

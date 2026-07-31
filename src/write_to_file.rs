@@ -21,7 +21,22 @@ use tokio::sync::oneshot;
 impl LogDefinition {
     async fn write_to_file(&mut self, flush_interval: &Duration) {
         for file in self.files.values_mut() {
-            file.write_to_file(flush_interval).await.unwrap()
+            // A disk error (no space, revoked permissions) must not kill the
+            // worker — a panic here would silently stop ALL logging until
+            // restart. Report once per failure episode on stderr and keep
+            // going; pending entries stay queued and retry on the next tick.
+            match file.write_to_file(flush_interval).await {
+                Ok(()) => file.write_error_logged = false,
+                Err(e) => {
+                    if !file.write_error_logged {
+                        eprintln!(
+                            "[op-log] write error for {}/{}: {e}",
+                            file.path, file.log_name
+                        );
+                        file.write_error_logged = true;
+                    }
+                }
+            }
         }
     }
 

@@ -121,6 +121,7 @@ impl LogDefinition {
                 path,
                 header,
                 logs: VecDeque::new(),
+                write_error_logged: false,
             }),
         }
     }
