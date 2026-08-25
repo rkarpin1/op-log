@@ -11,7 +11,6 @@ use rand::random;
 use std::cmp::min;
 use std::io;
 use std::io::prelude::*;
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use log::info;
@@ -100,33 +99,58 @@ fn truncated_frame_start<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result
             // the file ends inside the payload
             return Ok(Some(pos));
         }
-        reader.seek(SeekFrom::Start(next))?;
+        // the reader sits at `pos + available`; a relative seek lets a
+        // buffered reader skip small payloads without touching the disk
+        reader.seek_relative(next as i64 - (pos + available as u64) as i64)?;
         pos = next;
     }
     Ok(None)
 }
 
+/// Files above this size are appended to without the tail check. The walk
+/// reads the file front to back (frames carry no trailer to walk backwards
+/// from) and has to stay far below `WRITE_TIMEOUT` even on a cold disk: a
+/// check that timed out would repeat on every tick and never let the write
+/// through. Per-period files stay well under this; only a `NoSplit` file
+/// that has grown for a long time crosses it, and loses the check.
+const TAIL_CHECK_MAX_LEN: u64 = 64 * 1024 * 1024;
+
 /// Cuts an interrupted frame off the end of the file, if there is one, so
 /// that the next frame is appended on a frame boundary. Runs on the
-/// blocking pool: the walk is one seek per frame, far cheaper there than as
-/// a round trip through `tokio::fs` per frame.
+/// blocking pool: the walk is a buffered read of the prefixes, far cheaper
+/// there than as a round trip through `tokio::fs` per frame.
 async fn cut_interrupted_tail(path: &Path) -> io::Result<()> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::options().read(true).write(true).open(&path)?;
-        let len = file.metadata()?.len();
-        if let Some(cut) = truncated_frame_start(&mut file, len)? {
-            file.set_len(cut)?;
-            eprintln!(
-                "[op-log] {}: cut {} bytes of an interrupted frame before appending",
-                path.display(),
-                len - cut
-            );
-        }
-        Ok(())
-    })
-    .await
-    .map_err(io::Error::other)?
+    tokio::task::spawn_blocking(move || cut_interrupted_tail_up_to(&path, TAIL_CHECK_MAX_LEN))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn cut_interrupted_tail_up_to(path: &Path, max_len: u64) -> io::Result<()> {
+    let file = std::fs::File::options().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_len {
+        return Ok(());
+    }
+
+    let mut reader = io::BufReader::with_capacity(64 * 1024, &file);
+    let Some(cut) = truncated_frame_start(&mut reader, len)? else {
+        return Ok(());
+    };
+
+    // A write that timed out earlier may still be running in the background
+    // (see `WRITE_TIMEOUT`). If the file changed under the walk, the offset
+    // no longer describes it — leave it alone rather than cut a live frame.
+    if file.metadata()?.len() != len {
+        return Ok(());
+    }
+    file.set_len(cut)?;
+    eprintln!(
+        "[op-log] {}: cut {} bytes of an interrupted frame before appending",
+        path.display(),
+        len - cut
+    );
+    Ok(())
 }
 
 impl LogDefinition {
@@ -618,9 +642,18 @@ mod tests {
     // whose layout is unknown would destroy data instead of repairing it.
     #[test]
     fn tail_walker_leaves_unrecognised_layouts_alone() {
+        // Every case goes through a plain cursor and through a buffered
+        // reader whose tiny buffer forces refills inside prefixes and
+        // payloads — the production walk is buffered.
         let walk = |bytes: &[u8]| {
             let mut cursor = std::io::Cursor::new(bytes.to_vec());
-            super::truncated_frame_start(&mut cursor, bytes.len() as u64).unwrap()
+            let plain = super::truncated_frame_start(&mut cursor, bytes.len() as u64).unwrap();
+            let mut buffered =
+                std::io::BufReader::with_capacity(3, std::io::Cursor::new(bytes.to_vec()));
+            let via_buffer =
+                super::truncated_frame_start(&mut buffered, bytes.len() as u64).unwrap();
+            assert_eq!(plain, via_buffer, "buffering must not change the verdict");
+            plain
         };
         let magic = b"OPLog 1.0\n".as_slice();
         // marker, rnd, checksum, size 2 (VLQ 0x02 ^ 0xC5), two payload bytes
@@ -647,6 +680,31 @@ mod tests {
             Some(magic.len() as u64),
             "the only frame ends inside its prefix"
         );
+    }
+
+    // The check walks the whole file, so it is skipped above a size cap —
+    // a walk that outlived `WRITE_TIMEOUT` would repeat on every tick and
+    // never let the write through. Below the cap the tail is cut.
+    #[test]
+    fn tail_check_is_skipped_above_the_size_cap() {
+        let dir = temp_dir("cap");
+        let path = dir.join("test.log");
+        let frame = [0xffu8, 0x01, 0x02, 0x02 ^ 0xc5, 0xaa, 0xbb];
+        let content = [b"OPLog 1.0\n".as_slice(), &frame, &frame[..4]].concat();
+        std::fs::write(&path, &content).unwrap();
+        let len = content.len() as u64;
+
+        super::cut_interrupted_tail_up_to(&path, len - 1).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "above the cap: untouched");
+
+        super::cut_interrupted_tail_up_to(&path, len).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len - 4,
+            "at the cap: the interrupted frame is cut"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Pins the constant's value: a future change to the ceiling must be a
