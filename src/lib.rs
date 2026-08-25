@@ -79,6 +79,13 @@ struct LogFile {
     header: String,
     path: String,
     logs: VecDeque<String>,
+    /// Sum of the byte lengths of the entries in `logs`; bounded by
+    /// `QUEUE_MAX_BYTES` (see `add_to_log.rs`).
+    queued_bytes: usize,
+    /// Entries dropped from the front of `logs` to stay under the cap while
+    /// writes were failing; reported as a notice entry in the next
+    /// successful write, then reset.
+    dropped_logs: u64,
     /// True after a failed disk write was reported — keeps the error message
     /// to one per failure episode instead of one per writer tick.
     write_error_logged: bool,

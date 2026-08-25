@@ -12,6 +12,7 @@ An async file logging library for Rust built on Tokio. Log entries are compresse
 - Configurable write interval (`flush_interval`)
 - File header written once when a new log file is created
 - Timestamps in the Europe/Warsaw timezone
+- Bounded memory while the disk is unavailable: at most 8 MB of pending entries per file, the oldest are dropped, counted and reported into the log once writes succeed again
 - Optional automatic removal of inactive definitions (`auto_remove_definition`, unused for >10 min)
 - Automatic deletion of old files after N days
 

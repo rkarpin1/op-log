@@ -6,6 +6,7 @@ use crate::{LogDefinition, LogFile, OpLogWorker};
 use crate::messages::{OpLogOption, OpLogType};
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Warsaw;
+use chrono_tz::Tz;
 use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -16,6 +17,31 @@ fn format_date_in_log<'a>(log_type: &OpLogType) -> &'a str {
         OpLogType::PerHour => "%H:%M:%S.%3f",
         OpLogType::PerDay => "%H:%M:%S.%3f",
         OpLogType::PerMonth => "%d %H:%M:%S.%3f",
+    }
+}
+
+/// Ceiling on the bytes queued for one file. Entries pile up in memory
+/// while writes fail (no space left, a wedged volume) — the channel only
+/// buffers the way in, the worker drains it into the queue regardless. A
+/// long episode would otherwise grow the process without bound. Above the
+/// cap the OLDEST entries go: the newest ones describe what the process is
+/// doing now. Drops are counted and reported into the log itself once a
+/// write succeeds again, like `dropped_logs` does for a full channel.
+pub(crate) const QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Formats an entry the way it is stored in the queue and written to disk:
+/// with the period's timestamp prefix, unless the definition opts out.
+pub(crate) fn format_entry(
+    log_type: &OpLogType,
+    no_date: bool,
+    date: &DateTime<Tz>,
+    text: &str,
+) -> String {
+    let date_in_log = date.format(format_date_in_log(log_type)).to_string();
+    if date_in_log.is_empty() || no_date {
+        text.trim().to_string()
+    } else {
+        format!("{date_in_log} {text}")
     }
 }
 
@@ -73,13 +99,8 @@ impl OpLogWorker {
 
         let date = date.with_timezone(&Warsaw);
 
-        let date_in_log_format = format_date_in_log(&def.log_type);
-        let date_in_log = date.format(date_in_log_format).to_string();
-        let log = if date_in_log.is_empty() || def.options.contains(&OpLogOption::NoAddDateToLog) {
-            log.trim().to_string()
-        } else {
-            format!("{date_in_log} {log}")
-        };
+        let no_date = def.options.contains(&OpLogOption::NoAddDateToLog);
+        let log = format_entry(&def.log_type, no_date, &date, log);
 
         let date_in_path_format = format_date_in_path(&def.log_type);
         let date_in_path = date.format(date_in_path_format).to_string();
@@ -123,6 +144,8 @@ impl LogDefinition {
                 path,
                 header,
                 logs: VecDeque::new(),
+                queued_bytes: 0,
+                dropped_logs: 0,
                 write_error_logged: false,
                 tail_verified: false,
             }),
@@ -138,12 +161,23 @@ impl LogDefinition {
             log_file.time_of_first_addition_of_log_after_write = Some(Instant::now());
         }
 
+        log_file.queued_bytes += log.len();
         log_file.logs.push_back(log);
+
+        // Stay under the cap by dropping the oldest entries. The entry just
+        // added always survives, even if it is larger than the cap alone.
+        while log_file.queued_bytes > QUEUE_MAX_BYTES && log_file.logs.len() > 1 {
+            if let Some(dropped) = log_file.logs.pop_front() {
+                log_file.queued_bytes -= dropped.len();
+                log_file.dropped_logs += 1;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::QUEUE_MAX_BYTES;
     use crate::OpLogWorker;
     use crate::messages::{OpLogOption, OpLogType};
     use chrono::Utc;
@@ -178,6 +212,36 @@ mod tests {
             .flat_map(|f| f.logs.iter())
             .collect();
         assert_eq!(queued, vec!["entry without a timestamp"]);
+    }
+
+    // While writes fail the queue must not grow without bound: above the cap
+    // the oldest entries are dropped and counted, the newest are kept.
+    #[tokio::test]
+    async fn queue_stays_under_the_cap_by_dropping_the_oldest_entries() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut worker = OpLogWorker::new(rx);
+        define(&mut worker, &HashSet::new(), false);
+
+        let payload = "x".repeat(1024 * 1024);
+        for i in 0..10 {
+            worker.log("app", Utc::now(), &format!("{i}:{payload}"));
+        }
+
+        let file = worker.definitions["app"].files.values().next().unwrap();
+        assert!(
+            file.queued_bytes <= QUEUE_MAX_BYTES,
+            "queued bytes {} must stay under the cap {QUEUE_MAX_BYTES}",
+            file.queued_bytes
+        );
+        assert_eq!(
+            file.queued_bytes,
+            file.logs.iter().map(String::len).sum::<usize>(),
+            "the byte count must match the queue"
+        );
+        assert_eq!(file.dropped_logs, 3, "three 1 MB entries plus prefixes exceed 8 MB");
+        assert_eq!(file.logs.len(), 7);
+        assert!(file.logs.front().unwrap().contains(" 3:"), "the oldest entries go first");
+        assert!(file.logs.back().unwrap().contains(" 9:"), "the newest entry always survives");
     }
 
     // `def()` on an existing name is documented as an update: every field of

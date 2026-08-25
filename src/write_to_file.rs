@@ -2,9 +2,12 @@
 //   Copyright 2024-2025 (c) Robert Karpiński
 // -------------------------------------------------------------------------------------------------
 
-use crate::messages::OpLogInfo;
+use crate::add_to_log::format_entry;
+use crate::messages::{OpLogInfo, OpLogOption};
 use crate::{LogDefinition, LogFile, OpLogWorker};
 use bytes::{BufMut, BytesMut};
+use chrono::Utc;
+use chrono_tz::Europe::Warsaw;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::random;
@@ -155,7 +158,21 @@ fn cut_interrupted_tail_up_to(path: &Path, max_len: u64) -> io::Result<()> {
 
 impl LogDefinition {
     async fn write_to_file(&mut self, flush_interval: &Duration) {
+        let log_type = self.log_type;
+        let no_date = self.options.contains(&OpLogOption::NoAddDateToLog);
         for file in self.files.values_mut() {
+            // Entries dropped to stay under the queue cap are reported into
+            // the log itself, ahead of the entries that outlived them. The
+            // count is cleared only by a successful write, so a failed or
+            // timed-out attempt reports it again next time.
+            let backlog_notice = (file.dropped_logs > 0).then(|| {
+                let text = format!(
+                    "[op-log] dropped {} log entries (write backlog)",
+                    file.dropped_logs
+                );
+                format_entry(&log_type, no_date, &Utc::now().with_timezone(&Warsaw), &text)
+            });
+
             // A disk error (no space, revoked permissions) must not kill the
             // worker — a panic here would silently stop ALL logging until
             // restart. Report once per failure episode on stderr and keep
@@ -164,7 +181,8 @@ impl LogDefinition {
             // A HUNG write (stuck syscall, never returns) is the same class
             // of risk but doesn't go through `Result` at all — wrap the call
             // in a timeout so it always resolves to one.
-            let result = match timeout(WRITE_TIMEOUT, file.write_to_file(flush_interval)).await {
+            let write = file.write_to_file(flush_interval, backlog_notice.as_deref());
+            let result = match timeout(WRITE_TIMEOUT, write).await {
                 Ok(result) => result,
                 Err(_) => Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -233,7 +251,11 @@ impl OpLogWorker {
 }
 
 impl LogFile {
-    async fn write_to_file(&mut self, flush_interval: &Duration) -> io::Result<()> {
+    async fn write_to_file(
+        &mut self,
+        flush_interval: &Duration,
+        backlog_notice: Option<&str>,
+    ) -> io::Result<()> {
         if self.logs.is_empty() {
             self.time_of_first_addition_of_log_after_write = None;
             return Ok(());
@@ -296,6 +318,11 @@ impl LogFile {
         // below has succeeded (see `self.logs.drain(..consumed)` further
         // down) — a timeout before that point leaves `self.logs` untouched,
         // so the next tick retries the same entries in full.
+        if let Some(notice) = backlog_notice {
+            encoder.write_all(notice.as_bytes())?;
+            encoder.write_all(b"\n")?;
+        }
+
         let mut consumed = 0usize;
         loop {
             bytes.clear();
@@ -367,7 +394,11 @@ impl LogFile {
         // Only now, after the write is confirmed on disk, drop the entries
         // that were actually encoded above — a timeout anywhere before this
         // line leaves them in `self.logs` for the next attempt.
-        self.logs.drain(..consumed);
+        for written in self.logs.drain(..consumed) {
+            self.queued_bytes -= written.len();
+        }
+        // The notice above carried the count to disk.
+        self.dropped_logs = 0;
         // The file now ends on the boundary of the frame just written.
         self.tail_verified = true;
 
@@ -427,6 +458,58 @@ mod tests {
         let files = &worker.definitions["test"].files;
         assert_eq!(files.len(), 1, "the definition must have exactly one file");
         files.values().next().unwrap()
+    }
+
+    fn queued_file_mut(worker: &mut OpLogWorker) -> &mut crate::LogFile {
+        let files = &mut worker.definitions.get_mut("test").unwrap().files;
+        assert_eq!(files.len(), 1, "the definition must have exactly one file");
+        files.values_mut().next().unwrap()
+    }
+
+    // Entries dropped to keep the queue under its cap are not lost silently:
+    // the first write that succeeds again starts with a notice carrying the
+    // count, ahead of the entries that outlived the drops. A failed write
+    // must keep the count for the next attempt.
+    #[tokio::test]
+    async fn dropped_backlog_is_reported_by_the_first_successful_write() {
+        let dir = temp_dir("backlog");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let log_dir = blocker.join("logs");
+        let mut op_log = worker_with_flush_interval(&log_dir, "", Duration::from_millis(0));
+
+        op_log.log("test", Utc::now(), "kept");
+        queued_file_mut(&mut op_log).dropped_logs = 3;
+
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
+        assert_eq!(queued_file(&op_log).dropped_logs, 3, "a failed write must keep the drop count");
+
+        std::fs::remove_file(&blocker).unwrap();
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
+        assert_eq!(queued_file(&op_log).dropped_logs, 0, "a successful write reports and clears the count");
+        assert_eq!(queued_file(&op_log).queued_bytes, 0, "the byte count must follow the drain");
+
+        let raw = std::fs::read(log_dir.join("test.log")).unwrap();
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec!["[op-log] dropped 3 log entries (write backlog)\nkept\n".to_string()]
+        );
+
+        // nothing left to report: the next write carries no notice
+        op_log.log("test", Utc::now(), "later");
+        op_log.write_to_files().await;
+        let raw = std::fs::read(log_dir.join("test.log")).unwrap();
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec![
+                "[op-log] dropped 3 log entries (write backlog)\nkept\n".to_string(),
+                "later\n".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Independent decoder of the on-disk format, written from the README's
