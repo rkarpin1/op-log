@@ -113,7 +113,6 @@ pub struct OpLogCleanUpDefinition {
     pub delete_after_days: u32,
 }
 
-#[allow(dead_code)]
 pub enum OpLogMessage {
     Flush,
     GetInfoAndFlush(oneshot::Sender<OpLogInfo>),
