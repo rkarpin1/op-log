@@ -121,19 +121,19 @@ impl OpLogWorker {
             }
         };
 
-        def.add_to_log(log_name, path, def.header.clone(), log)
+        def.add_to_log(log_name, path, log)
     }
 }
 
 impl LogDefinition {
-    fn get_log_file(&mut self, log_name: String, path: String, header: String) -> &mut LogFile {
+    fn get_log_file(&mut self, log_name: String, path: String) -> &mut LogFile {
         let file_name = format!("{path}/{log_name}");
 
         match self.files.entry(file_name) {
             Entry::Occupied(e) => {
                 let file = e.into_mut();
-                if file.header != header {
-                    file.header = header;
+                if file.header != self.header {
+                    file.header = self.header.clone();
                 }
                 file
             }
@@ -142,7 +142,7 @@ impl LogDefinition {
                 time_of_first_addition_of_log_after_write: None,
                 log_name,
                 path,
-                header,
+                header: self.header.clone(),
                 logs: VecDeque::new(),
                 queued_bytes: 0,
                 dropped_logs: 0,
@@ -152,8 +152,8 @@ impl LogDefinition {
         }
     }
 
-    fn add_to_log(&mut self, log_name: String, path: String, header: String, log: String) {
-        let log_file = self.get_log_file(log_name, path, header);
+    fn add_to_log(&mut self, log_name: String, path: String, log: String) {
+        let log_file = self.get_log_file(log_name, path);
 
         log_file.last_time_use = Instant::now();
 
