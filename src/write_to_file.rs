@@ -603,15 +603,26 @@ mod tests {
         let dir = temp_dir("tail");
         let path = dir.join("test.log");
 
+        // the second entry is incompressible and long, so its frame carries
+        // a multi-byte size field — the walker must decode it exactly, or
+        // it would cut a valid file
+        let mut state = 12345u32;
+        let second: String = (0..40_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from(b'a' + ((state >> 16) % 26) as u8)
+            })
+            .collect();
+
         let mut op_log = worker_with_no_split_definition(&dir, "");
         op_log.log("test", Utc::now(), "first");
         op_log.flush().await;
         let len1 = std::fs::metadata(&path).unwrap().len();
-        op_log.log("test", Utc::now(), "second");
+        op_log.log("test", Utc::now(), &second);
         op_log.flush().await;
         let clean = std::fs::read(&path).unwrap();
         let frame2 = clean.len() as u64 - len1;
-        assert!(frame2 > 8, "the second frame must allow cuts inside its prefix and its payload");
+        assert!(frame2 > 16_384, "the second frame must need a three-byte size field: {frame2}");
 
         // bytes of the second frame kept on disk — the whole frame (no cut),
         // 1..=4 (cut inside the prefix: marker, rnd, checksum, size), and
@@ -626,7 +637,7 @@ mod tests {
 
             let raw = std::fs::read(&path).unwrap();
             let expected: Vec<String> = if kept == frame2 {
-                vec!["first\n".into(), "second\n".into(), "third\n".into()]
+                vec!["first\n".into(), format!("{second}\n"), "third\n".into()]
             } else {
                 vec!["first\n".into(), "third\n".into()]
             };
@@ -680,6 +691,37 @@ mod tests {
             Some(magic.len() as u64),
             "the only frame ends inside its prefix"
         );
+
+        // sizes that need two and three VLQ bytes, encoded the way the
+        // writer does it (7 bits per byte, low group first, 0x80 continues)
+        for size in [200usize, 20_000] {
+            let mut big = vec![0xff, 0x01, 0x02];
+            let mut rest = size;
+            loop {
+                let mut a = (rest & 0x7f) as u8;
+                rest >>= 7;
+                if rest != 0 {
+                    a |= 0x80;
+                }
+                big.push(a ^ 0xc5);
+                if rest == 0 {
+                    break;
+                }
+            }
+            big.extend(std::iter::repeat_n(0x55u8, size));
+            assert_eq!(walk(&[magic, &big].concat()), None, "complete {size}-byte frame");
+            assert_eq!(walk(&[magic, &big, frame].concat()), None, "followed by a complete frame");
+            assert_eq!(
+                walk(&[magic, frame, &big[..big.len() - 1]].concat()),
+                Some((magic.len() + frame.len()) as u64),
+                "{size}-byte frame short of its last byte"
+            );
+            assert_eq!(
+                walk(&[magic, &big, &frame[..1]].concat()),
+                Some((magic.len() + big.len()) as u64),
+                "a marker alone after a complete {size}-byte frame"
+            );
+        }
     }
 
     // The check walks the whole file, so it is skipped above a size cap —
