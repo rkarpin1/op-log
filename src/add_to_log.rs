@@ -38,10 +38,23 @@ pub(crate) fn format_entry(
 ) -> String {
     let date_format = format_date_in_log(log_type);
     if date_format.is_empty() || no_date {
-        text.trim().to_string()
-    } else {
-        format!("{} {text}", date.format(date_format))
+        return text.trim().to_string();
     }
+    // One allocation for the whole entry: the timestamp is written straight
+    // into it. Going through `Display` (`format!("{} {text}", ..)`) would
+    // format the timestamp into a String of its own first, then grow the
+    // entry from the size of the literal pieces.
+    let mut entry = String::with_capacity(text.len() + 16);
+    write_date(&mut entry, date, date_format);
+    entry.push(' ');
+    entry.push_str(text);
+    entry
+}
+
+/// Appends `date` formatted with `format` to `out`. The formats used here
+/// are constants without an error item, so the formatting cannot fail.
+fn write_date(out: &mut String, date: &DateTime<Tz>, format: &str) {
+    date.format(format).write_to(out).expect("constant date format")
 }
 
 fn format_date_in_path<'a>(log_type: &OpLogType) -> &'a str {
@@ -102,21 +115,25 @@ impl OpLogWorker {
         let log = format_entry(&def.log_type, no_date, &date, log);
 
         let date_in_path_format = format_date_in_path(&def.log_type);
-        let date_in_path = date.format(date_in_path_format);
 
         let (log_name, path) = if date_in_path_format.is_empty() {
             (format!("{}.log", log_name), def.path.to_string())
         } else {
+            // The period is written straight into the name or the path
+            // (see `format_entry`), not through `Display`.
             if def.options.contains(&OpLogOption::UseSubDirectories) {
-                (
-                    format!("{}.log", log_name),
-                    format!("{}/{}", def.path, date_in_path),
-                )
+                let mut path = String::with_capacity(def.path.len() + 16);
+                path.push_str(&def.path);
+                path.push('/');
+                write_date(&mut path, &date, date_in_path_format);
+                (format!("{}.log", log_name), path)
             } else {
-                (
-                    format!("{}_{}.log", log_name, date_in_path),
-                    def.path.to_string(),
-                )
+                let mut log_name_in_period = String::with_capacity(log_name.len() + 20);
+                log_name_in_period.push_str(log_name);
+                log_name_in_period.push('_');
+                write_date(&mut log_name_in_period, &date, date_in_path_format);
+                log_name_in_period.push_str(".log");
+                (log_name_in_period, def.path.to_string())
             }
         };
 
