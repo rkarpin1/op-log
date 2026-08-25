@@ -102,9 +102,9 @@ impl OpLogWorker {
         let log = format_entry(&def.log_type, no_date, &date, log);
 
         let date_in_path_format = format_date_in_path(&def.log_type);
-        let date_in_path = date.format(date_in_path_format).to_string();
+        let date_in_path = date.format(date_in_path_format);
 
-        let (log_name, path) = if date_in_path.is_empty() {
+        let (log_name, path) = if date_in_path_format.is_empty() {
             (format!("{}.log", log_name), def.path.to_string())
         } else {
             if def.options.contains(&OpLogOption::UseSubDirectories) {
