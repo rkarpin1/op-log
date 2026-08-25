@@ -17,6 +17,17 @@ use tokio::fs;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
+
+/// Sufit czasu na pojedynczy zapis pliku (create_dir_all + open + write + flush).
+/// Bez tego, zawieszony syscall (np. chwilowe zacięcie wolumenu) blokuje
+/// `.await` w nieskończoność — a to jest jedyny wspólny task obsługujący
+/// WSZYSTKIE zdefiniowane logi naraz, więc jego zawieszenie ubija logowanie
+/// na stałe, do restartu procesu. Zmierzone jako przyczyna 10-dniowej przerwy
+/// w logach w konsumencie tej biblioteki (x-ai, incydent 2026-08-15..08-25):
+/// proces żył, dysk miał miejsce, brak paniki w journalu — worker po prostu
+/// nigdy nie wrócił z jednego `.await`.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LogDefinition {
     async fn write_to_file(&mut self, flush_interval: &Duration) {
@@ -25,7 +36,18 @@ impl LogDefinition {
             // worker — a panic here would silently stop ALL logging until
             // restart. Report once per failure episode on stderr and keep
             // going; pending entries stay queued and retry on the next tick.
-            match file.write_to_file(flush_interval).await {
+            //
+            // A HUNG write (stuck syscall, never returns) is the same class
+            // of risk but doesn't go through `Result` at all — wrap the call
+            // in a timeout so it always resolves to one.
+            let result = match timeout(WRITE_TIMEOUT, file.write_to_file(flush_interval)).await {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("write did not complete within {WRITE_TIMEOUT:?}"),
+                )),
+            };
+            match result {
                 Ok(()) => file.write_error_logged = false,
                 Err(e) => {
                     if !file.write_error_logged {
@@ -235,5 +257,27 @@ mod tests {
         let c = op_log.log_count();
         println!("{}", c);
         op_log.flush().await;
+    }
+
+    // Przypina wartość stałej: przyszła zmiana sufitu ma być świadomą
+    // decyzją, nie przypadkowym skutkiem refaktoru.
+    #[test]
+    fn write_timeout_constant_matches_documented_value() {
+        assert_eq!(super::WRITE_TIMEOUT, Duration::from_secs(15));
+    }
+
+    // Symuluje zawieszony syscall zapisu: future, która nigdy się nie kończy.
+    // Prawdziwego zawieszonego dysku nie da się deterministycznie zasymulować
+    // bez mockowania systemu plików — to sprawdza sam mechanizm, na którym
+    // stoi cała poprawka, z krótkim lokalnym czasem, żeby test pozostał szybki.
+    #[tokio::test]
+    async fn timeout_wraps_a_stuck_operation_and_errors_out() {
+        let stuck = std::future::pending::<std::io::Result<()>>();
+        let result = tokio::time::timeout(Duration::from_millis(20), stuck).await;
+        assert!(
+            result.is_err(),
+            "timeout must interrupt an operation that never completes, \
+             otherwise the worker hangs forever"
+        );
     }
 }

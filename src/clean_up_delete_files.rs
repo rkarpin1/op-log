@@ -79,7 +79,7 @@ impl OpLogWorker {
 
                     if remove_dir(&entry.path()).await.is_ok() {
                         info!(target: "log", "remove dir:{}, after-days:{}",
-                            &entry.path().to_str().unwrap(),
+                            entry.path().display(),
                         delete_after_days)
                     }
 
@@ -103,7 +103,7 @@ impl OpLogWorker {
 
         if deleted_count > 0 {
             info!(target: "log", "deleted:{} - path:{}, after-days:{}",
-            deleted_count, path.to_str().unwrap(),
+            deleted_count, path.display(),
             delete_after_days, );
         }
     }
