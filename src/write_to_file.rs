@@ -206,7 +206,7 @@ impl LogDefinition {
     }
 
     fn log_count(&self) -> usize {
-        self.files.values().map(|f| f.log_count()).sum()
+        self.files.values().map(|f| f.logs.len()).sum()
     }
 }
 
@@ -407,10 +407,6 @@ impl LogFile {
         }
 
         Ok(())
-    }
-
-    fn log_count(&self) -> usize {
-        self.logs.len()
     }
 }
 
