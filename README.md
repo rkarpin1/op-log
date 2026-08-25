@@ -120,6 +120,8 @@ Each `.log` file starts with the ASCII header `OPLog 1.0\n`, followed by data bl
 
 The data inside each block is UTF-8 text compressed with zlib, then obfuscated with XOR using a pseudorandom key derived from `rnd` and the data length.
 
+A write cut short (disk full mid-block, a crash between the prefix and the data) can leave a file ending inside a block. Before appending to an existing file, the worker walks its blocks and cuts such an incomplete tail back to the last block boundary, so readers never meet a block followed by frames it claims to contain. Files larger than 64 MB are appended to without this check.
+
 ## License
 
 Copyright 2024-2025 Robert Karpiński
