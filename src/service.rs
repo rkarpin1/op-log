@@ -20,7 +20,7 @@ impl OpLogWorker {
                 _ = writer_tick.tick() => self.write_to_files().await,
                 _ = cleanup_tick.tick() => {
                     self.clean_up();
-                    self.clean_up_delete_files().await;
+                    self.clean_up_delete_files_bounded().await;
                 }
                 msg = self.rx_channel.recv() => {
                     match msg {

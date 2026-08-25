@@ -6,13 +6,49 @@ use crate::messages::OpLogCleanUpDefinition;
 use crate::{LogCleanUpDefinition, OpLogWorker};
 use log::info;
 use std::cmp::min;
+use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::fs::remove_dir;
 use tokio::fs::{read_dir, remove_file, DirEntry};
 use tokio::io;
+use tokio::time::timeout;
+
+/// Ceiling on one pass of the old-file cleanup. The pass runs in the same
+/// task as the writer, so every second it takes is a second without log
+/// writes — and a stuck syscall inside it (`read_dir`, `metadata`,
+/// `remove_file`) would hang the worker for good, the same way a stuck
+/// write did before `WRITE_TIMEOUT`. A healthy pass over a consumer's tree
+/// takes milliseconds; a pass that does not finish is cut off and starts
+/// over on the next cleanup tick — deleting is idempotent and every partial
+/// pass has already removed something, so it converges.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs one cleanup pass under `CLEANUP_TIMEOUT`; returns whether it
+/// completed.
+async fn run_bounded<F: Future<Output = ()>>(pass: F) -> bool {
+    timeout(CLEANUP_TIMEOUT, pass).await.is_ok()
+}
 
 impl OpLogWorker {
+    /// One pass of the old-file cleanup, cut off after `CLEANUP_TIMEOUT`.
+    pub(crate) async fn clean_up_delete_files_bounded(&mut self) {
+        let completed = run_bounded(self.clean_up_delete_files()).await;
+        self.note_cleanup_outcome(completed);
+    }
+
+    fn note_cleanup_outcome(&mut self, completed: bool) {
+        if completed {
+            self.cleanup_timed_out = false;
+        } else if !self.cleanup_timed_out {
+            eprintln!(
+                "[op-log] file cleanup did not complete within {CLEANUP_TIMEOUT:?}; \
+                 it resumes on the next cleanup tick"
+            );
+            self.cleanup_timed_out = true;
+        }
+    }
+
     pub(crate) fn clean_up_remove_all_definitions(&mut self) {
         self.clean_up_definitions.clear();
     }
@@ -122,6 +158,7 @@ impl OpLogWorker {
 mod tests {
     use super::OpLogWorker;
     use std::ffi::OsString;
+    use std::time::Duration;
 
     // A name the OS accepts but that is not valid UTF-8 — the case that used
     // to panic the shared worker task via `.to_str().unwrap()`. Each platform
@@ -166,5 +203,41 @@ mod tests {
         assert!(!bad_dir.exists(), "emptied directory with a non-UTF-8 name should be gone");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // A future change of the ceiling must be a deliberate decision, not a
+    // side effect of a refactor.
+    #[test]
+    fn cleanup_timeout_constant_matches_documented_value() {
+        assert_eq!(super::CLEANUP_TIMEOUT, Duration::from_secs(60));
+    }
+
+    // A cleanup pass that never finishes (a stuck syscall) must be cut off
+    // at the ceiling instead of hanging the shared worker task; a pass that
+    // finishes is left alone. Paused time makes the 60 s virtual.
+    #[tokio::test(start_paused = true)]
+    async fn stuck_cleanup_pass_is_cut_off_at_the_ceiling() {
+        let started = tokio::time::Instant::now();
+        let completed = super::run_bounded(std::future::pending::<()>()).await;
+        assert!(!completed, "a pass that never finishes must be reported as cut off");
+        assert_eq!(started.elapsed(), super::CLEANUP_TIMEOUT, "cut off exactly at the ceiling");
+
+        let completed = super::run_bounded(async {}).await;
+        assert!(completed, "a finished pass must not be reported as cut off");
+    }
+
+    // The cut-off is reported once per episode and the episode closes with
+    // the first pass that completes again.
+    #[tokio::test]
+    async fn cleanup_cut_off_is_reported_once_per_episode() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut worker = OpLogWorker::new(rx);
+
+        worker.note_cleanup_outcome(false);
+        assert!(worker.cleanup_timed_out, "the first cut-off opens an episode");
+        worker.note_cleanup_outcome(false);
+        assert!(worker.cleanup_timed_out, "a repeated cut-off keeps the episode open");
+        worker.note_cleanup_outcome(true);
+        assert!(!worker.cleanup_timed_out, "a completed pass closes the episode");
     }
 }

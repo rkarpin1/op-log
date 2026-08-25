@@ -109,7 +109,7 @@ log.clean_up_definition(OpLogCleanUpDefinition {
 });
 ```
 
-The worker runs cleanup every 5 minutes, deleting files (and empty directories) older than the specified number of days.
+The worker runs cleanup every 5 minutes, deleting files (and empty directories) older than the specified number of days. One cleanup pass is cut off after 60 seconds (it runs in the same task as the writer, so it must never hang it); a cut-off pass starts over on the next tick.
 
 ## File format
 

@@ -104,6 +104,9 @@ struct OpLogWorker {
     definitions: HashMap<String, LogDefinition>,
     clean_up_definitions: Vec<LogCleanUpDefinition>,
     rx_channel: Receiver<OpLogMessage>,
+    /// True after a file-cleanup pass was cut off by `CLEANUP_TIMEOUT` and
+    /// reported — keeps the message to one per episode, not one per tick.
+    cleanup_timed_out: bool,
 }
 
 impl OpLogWorker {
@@ -112,6 +115,7 @@ impl OpLogWorker {
             definitions: HashMap::new(),
             clean_up_definitions: Vec::new(),
             rx_channel: rx,
+            cleanup_timed_out: false,
         }
     }
 }
