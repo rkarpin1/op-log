@@ -142,7 +142,12 @@ impl LogFile {
 
         path.push(&self.log_name);
 
-        let mut f = if fs::metadata(&path).await.is_ok() {
+        // A zero-length file cannot be a valid log (every file starts with
+        // the magic) — a crash or a full disk right after `File::create`
+        // leaves exactly that behind. Treat it as new, otherwise frames get
+        // appended to a file without its magic and readers reject it whole.
+        let has_content = fs::metadata(&path).await.map(|m| m.len() > 0).unwrap_or(false);
+        let mut f = if has_content {
             File::options().append(true).open(&path).await?
         } else {
             let mut f = File::create(&path).await?;
@@ -352,6 +357,37 @@ mod tests {
         assert_eq!(decode_oplog_file(&raw), vec![format!("{header}
 {entry}
 ")]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A zero-length file at the log's path is what a crash or a full disk
+    // right after `File::create` leaves behind. It must be treated as a new
+    // file: appending frames to it would produce a file without the magic,
+    // which downstream readers reject as a whole. A non-empty file must still
+    // be appended to, never truncated.
+    #[tokio::test]
+    async fn empty_existing_file_is_rewritten_with_the_magic() {
+        let dir = temp_dir("empty");
+        std::fs::write(dir.join("test.log"), b"").unwrap();
+        let mut op_log = worker_with_no_split_definition(&dir, "");
+
+        op_log.log("test", Utc::now(), "first");
+        op_log.flush().await;
+        let raw = std::fs::read(dir.join("test.log")).unwrap();
+        assert_eq!(decode_oplog_file(&raw), vec!["first
+".to_string()]);
+
+        op_log.log("test", Utc::now(), "second");
+        op_log.flush().await;
+        let raw = std::fs::read(dir.join("test.log")).unwrap();
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec!["first
+".to_string(), "second
+".to_string()],
+            "a non-empty file must be appended to"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
