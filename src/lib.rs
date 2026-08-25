@@ -272,13 +272,24 @@ impl Default for OpLog {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    // The final flush of `shutdown()` writes a real file — keep it out of
+    // the working tree.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("op-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[tokio::test]
     async fn user_facing_api() {
+        let dir = temp_dir("api");
         let op = OpLog::new();
 
-        let def = OpLogDefinition::new("test", ".")
+        let def = OpLogDefinition::new("test", dir.to_str().unwrap())
             .log_type(OpLogType::PerHour)
             .flush_interval(Duration::from_secs(60));
 
@@ -296,6 +307,8 @@ mod tests {
 
         // second shutdown call must be a no-op (idempotent)
         op2.shutdown().await;
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Exercises send_log directly against a tiny channel with no worker:
@@ -344,10 +357,11 @@ mod tests {
     // a second def_system_log call in the same process would install on a dead OpLog.
     #[tokio::test]
     async fn def_system_log_registers_definition_and_routes_log() {
+        let dir = temp_dir("system-log");
         let op = OpLog::new();
 
         op.def_system_log(
-            OpLogDefinition::new("log", ".")
+            OpLogDefinition::new("log", dir.to_str().unwrap())
                 .log_type(OpLogType::PerHour)
                 .flush_interval(Duration::from_secs(60)),
         );
@@ -363,6 +377,8 @@ mod tests {
         assert!(info.number_of_logs >= 1, "info! must route to OpLog");
 
         op.shutdown().await;
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The worker can be busy (a slow disk write, a flush) long enough for
