@@ -204,15 +204,11 @@ impl LogDefinition {
             }
         }
     }
-
-    fn log_count(&self) -> usize {
-        self.files.values().map(|f| f.logs.len()).sum()
-    }
 }
 
 impl OpLogWorker {
     fn log_count(&self) -> usize {
-        self.definitions.values().map(|def| def.log_count()).sum()
+        self.definitions.values().flat_map(|d| d.files.values()).map(|f| f.logs.len()).sum()
     }
 
     pub(crate) async fn write_to_files(&mut self) {
