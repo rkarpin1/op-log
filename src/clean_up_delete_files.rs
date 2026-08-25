@@ -99,11 +99,12 @@ impl OpLogWorker {
 
             if let Ok(file_type) = entry.file_type().await {
                 if file_type.is_dir() {
-                    Box::pin(self.delete_files_in_path(&entry.path(), delete_after_days)).await;
+                    let dir_path = entry.path();
+                    Box::pin(self.delete_files_in_path(&dir_path, delete_after_days)).await;
 
-                    if remove_dir(&entry.path()).await.is_ok() {
+                    if remove_dir(&dir_path).await.is_ok() {
                         info!(target: "log", "remove dir:{}, after-days:{}",
-                            entry.path().display(),
+                            dir_path.display(),
                         delete_after_days)
                     }
 
