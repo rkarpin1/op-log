@@ -276,6 +276,14 @@ mod tests {
     }
 
     fn worker_with_no_split_definition(dir: &std::path::Path, header: &str) -> OpLogWorker {
+        worker_with_flush_interval(dir, header, Duration::from_secs(10))
+    }
+
+    fn worker_with_flush_interval(
+        dir: &std::path::Path,
+        header: &str,
+        flush_interval: Duration,
+    ) -> OpLogWorker {
         let (_tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = OpLogWorker::new(rx);
         worker.def(
@@ -283,11 +291,17 @@ mod tests {
             dir.to_str().unwrap(),
             OpLogType::NoSplit,
             &HashSet::new(),
-            Duration::from_secs(10),
+            flush_interval,
             header,
             false,
         );
         worker
+    }
+
+    fn queued_file(worker: &OpLogWorker) -> &crate::LogFile {
+        let files = &worker.definitions["test"].files;
+        assert_eq!(files.len(), 1, "the definition must have exactly one file");
+        files.values().next().unwrap()
     }
 
     // Independent decoder of the on-disk format, written from the README's
@@ -388,6 +402,44 @@ mod tests {
 ".to_string()],
             "a non-empty file must be appended to"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The promise behind `write_error_logged`: a write that fails (no space,
+    // revoked permissions, a path that cannot be created) must neither kill
+    // the worker nor lose the entries — they stay queued, the error is
+    // reported once, and the first successful write after the cause is gone
+    // delivers them and ends the episode. The failure is injected by making
+    // the log directory's parent a regular FILE, which fails on every
+    // platform; removing that file is "the cause is gone".
+    #[tokio::test]
+    async fn write_error_keeps_entries_and_the_next_successful_write_delivers_them() {
+        let dir = temp_dir("retry");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let log_dir = blocker.join("logs");
+        let mut op_log = worker_with_flush_interval(&log_dir, "", Duration::from_millis(0));
+
+        op_log.log("test", Utc::now(), "entry");
+
+        // one writer tick: the write fails, the entry survives, the episode is open
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
+        assert!(queued_file(&op_log).write_error_logged, "the failure must open an error episode");
+
+        // a second failing tick must not lose the entry either
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 1, "repeated failures must keep the entry queued");
+
+        // the cause is gone: the next tick writes and closes the episode
+        std::fs::remove_file(&blocker).unwrap();
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
+        assert!(!queued_file(&op_log).write_error_logged, "a successful write must close the episode");
+
+        let raw = std::fs::read(log_dir.join("test.log")).unwrap();
+        assert_eq!(decode_oplog_file(&raw), vec!["entry\n".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
