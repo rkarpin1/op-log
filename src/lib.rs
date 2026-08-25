@@ -164,11 +164,8 @@ impl OpLog {
     /// Spawns the background worker. Must be called inside a Tokio runtime.
     pub fn new() -> OpLog {
         let (tx, rx) = mpsc::channel::<OpLogMessage>(CHANNEL_CAPACITY);
-        let worker = OpLogWorker::new(rx);
-        let handle = tokio::spawn(async move {
-            let mut w = worker;
-            w.run().await;
-        });
+        let mut worker = OpLogWorker::new(rx);
+        let handle = tokio::spawn(async move { worker.run().await });
         OpLog(std::sync::Arc::new(OpLogInner {
             tx,
             handle: Mutex::new(Some(handle)),
