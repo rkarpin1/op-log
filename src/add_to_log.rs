@@ -75,7 +75,7 @@ impl OpLogWorker {
 
         let date_in_log_format = format_date_in_log(&def.log_type);
         let date_in_log = date.format(date_in_log_format).to_string();
-        let log = if date_in_log.is_empty() {
+        let log = if date_in_log.is_empty() || def.options.contains(&OpLogOption::NoAddDateToLog) {
             log.trim().to_string()
         } else {
             format!("{date_in_log} {log}")
@@ -159,6 +159,24 @@ mod tests {
             "",
             auto_remove,
         );
+    }
+
+    // `NoAddDateToLog` is documented as "does not prepend a timestamp to each
+    // log entry" — the queued entry must be the caller's text as is.
+    #[tokio::test]
+    async fn no_add_date_option_leaves_the_entry_without_timestamp() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut worker = OpLogWorker::new(rx);
+        define(&mut worker, &HashSet::from([OpLogOption::NoAddDateToLog]), false);
+
+        worker.log("app", Utc::now(), "entry without a timestamp");
+
+        let queued: Vec<&String> = worker.definitions["app"]
+            .files
+            .values()
+            .flat_map(|f| f.logs.iter())
+            .collect();
+        assert_eq!(queued, vec!["entry without a timestamp"]);
     }
 
     // `def()` on an existing name is documented as an update: every field of
