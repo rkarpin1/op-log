@@ -259,28 +259,101 @@ mod tests {
     use crate::messages::OpLogType;
     use chrono::Utc;
     use std::collections::HashSet;
+    use std::io::Read;
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn write_to_file() {
-        let (_tx, rx) = tokio::sync::mpsc::channel(32);
-        let mut op_log = OpLogWorker::new(rx);
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("op-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
-        op_log.def(
+    fn worker_with_no_split_definition(dir: &std::path::Path, header: &str) -> OpLogWorker {
+        let (_tx, rx) = tokio::sync::mpsc::channel(32);
+        let mut worker = OpLogWorker::new(rx);
+        worker.def(
             "test",
-            ".",
-            OpLogType::PerHour,
+            dir.to_str().unwrap(),
+            OpLogType::NoSplit,
             &HashSet::new(),
             Duration::from_secs(10),
-            "header, jest długi bez z półskimi liter ŻĄŁ",
-            false
+            header,
+            false,
         );
+        worker
+    }
 
-        op_log.log("test", Utc::now(), "log, to ładny i ŻAŁOŚĆ to słowo");
+    // Independent decoder of the on-disk format, written from the README's
+    // description (the same contract the external `emi-oplog` reader relies
+    // on): magic, then `[0xFF][rnd][checksum][size VLQ ^ 0xC5][zlib ^ key]`.
+    // Returns the text of every block.
+    fn decode_oplog_file(raw: &[u8]) -> Vec<String> {
+        const MAGIC: &[u8] = b"OPLog 1.0
+";
+        assert!(raw.starts_with(MAGIC), "file must start with the OPLog 1.0 magic");
+        let mut pos = MAGIC.len();
+        let mut blocks = Vec::new();
+        while pos < raw.len() {
+            assert_eq!(raw[pos], 0xff, "block marker expected at offset {pos}");
+            let rnd = raw[pos + 1];
+            let checksum = raw[pos + 2] ^ 0x5c;
+            pos += 3;
 
-        let c = op_log.log_count();
-        println!("{}", c);
+            let mut size = 0usize;
+            let mut shift = 0;
+            loop {
+                let b = raw[pos] ^ 0xc5;
+                pos += 1;
+                size |= ((b & 0x7f) as usize) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+
+            let mut payload = raw[pos..pos + size].to_vec();
+            pos += size;
+
+            let mut xor: u32 = (rnd as u32 * size as u32) & 0xfff;
+            let mut sum = 0u32;
+            for byte in payload.iter_mut() {
+                xor = (xor * 2903 + 71) & 0xfff;
+                *byte ^= (xor & 0xff) as u8;
+                sum = (sum + *byte as u32) & 0xff;
+            }
+            assert_eq!(sum as u8, checksum, "block checksum must match");
+
+            let mut text = String::new();
+            flate2::read::ZlibDecoder::new(&payload[..])
+                .read_to_string(&mut text)
+                .expect("block must be a valid zlib stream of UTF-8 text");
+            blocks.push(text);
+        }
+        blocks
+    }
+
+    // Round trip through the real write path: the file on disk must decode
+    // back to the header and the entry, and the queue must be drained.
+    #[tokio::test]
+    async fn write_to_file() {
+        let dir = temp_dir("write");
+        let header = "header, jest długi bez z półskimi liter ŻĄŁ";
+        let entry = "log, to ładny i ŻAŁOŚĆ to słowo";
+        let mut op_log = worker_with_no_split_definition(&dir, header);
+
+        op_log.log("test", Utc::now(), entry);
+        assert_eq!(op_log.log_count(), 1);
         op_log.flush().await;
+        assert_eq!(op_log.log_count(), 0, "flush must drain the queue");
+
+        let raw = std::fs::read(dir.join("test.log")).unwrap();
+        assert_eq!(decode_oplog_file(&raw), vec![format!("{header}
+{entry}
+")]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Pins the constant's value: a future change to the ceiling must be a
