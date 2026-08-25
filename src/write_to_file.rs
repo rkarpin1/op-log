@@ -5,7 +5,6 @@
 use crate::add_to_log::format_entry;
 use crate::messages::{OpLogInfo, OpLogOption};
 use crate::{LogDefinition, LogFile, OpLogWorker};
-use bytes::{BufMut, BytesMut};
 use chrono::Utc;
 use chrono_tz::Europe::Warsaw;
 use flate2::write::ZlibEncoder;
@@ -264,7 +263,7 @@ impl LogFile {
             }
         }
 
-        let mut bytes = BytesMut::with_capacity(1024);
+        let mut bytes: Vec<u8> = Vec::with_capacity(1024);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
 
         let mut path = PathBuf::from(&self.path);
@@ -322,8 +321,8 @@ impl LogFile {
             bytes.clear();
 
             while let Some(log) = self.logs.get(consumed) {
-                bytes.put(log.as_bytes());
-                bytes.put_u8(0x0a);
+                bytes.extend_from_slice(log.as_bytes());
+                bytes.push(0x0a);
                 consumed += 1;
 
                 if bytes.len() > 64000 {
@@ -363,9 +362,9 @@ impl LogFile {
         }
 
         bytes.clear();
-        bytes.put_u8(0xff);
-        bytes.put_u8(rnd);
-        bytes.put_u8((sum as u8) ^ 0x5c);
+        bytes.push(0xff);
+        bytes.push(rnd);
+        bytes.push((sum as u8) ^ 0x5c);
 
         loop {
             let mut a: u8 = (size & 0x7F) as u8;
@@ -374,7 +373,7 @@ impl LogFile {
                 a |= 0x80
             };
 
-            bytes.put_u8(a ^ 0xc5);
+            bytes.push(a ^ 0xc5);
             if size == 0 {
                 break;
             }
