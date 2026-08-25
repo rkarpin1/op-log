@@ -37,11 +37,11 @@ pub(crate) fn format_entry(
     date: &DateTime<Tz>,
     text: &str,
 ) -> String {
-    let date_in_log = date.format(format_date_in_log(log_type)).to_string();
-    if date_in_log.is_empty() || no_date {
+    let date_format = format_date_in_log(log_type);
+    if date_format.is_empty() || no_date {
         text.trim().to_string()
     } else {
-        format!("{date_in_log} {text}")
+        format!("{} {text}", date.format(date_format))
     }
 }
 
