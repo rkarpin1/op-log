@@ -226,7 +226,10 @@ impl OpLog {
     /// Stops the worker and waits for it to finish (including a final flush).
     /// Idempotent — safe to call from any clone; subsequent calls are no-ops.
     pub async fn shutdown(&self) {
-        let _ = self.0.tx.try_send(OpLogMessage::StopService);
+        // Wait for channel room rather than `try_send`: a full channel would
+        // drop the stop signal and leave `h.await` below waiting forever. If
+        // the worker is already gone the send fails immediately.
+        let _ = self.0.tx.send(OpLogMessage::StopService).await;
         let handle = self.0.handle.lock().unwrap().take();
         if let Some(h) = handle {
             let _ = h.await;
@@ -356,5 +359,22 @@ mod tests {
         assert!(info.number_of_logs >= 1, "info! must route to OpLog");
 
         op.shutdown().await;
+    }
+
+    // The worker can be busy (a slow disk write, a flush) long enough for
+    // producers to fill the channel. `shutdown()` must still deliver its stop
+    // signal — a dropped stop leaves the caller awaiting a worker that never
+    // ends. The current_thread test runtime doesn't poll the worker until we
+    // await, so the channel is guaranteed full when shutdown is called.
+    #[tokio::test]
+    async fn shutdown_completes_even_when_channel_is_full() {
+        let op = OpLog::new();
+        for i in 0..(CHANNEL_CAPACITY + 16) {
+            op.log("nobody", Utc::now(), &format!("entry {i}"));
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), op.shutdown())
+            .await
+            .expect("shutdown must finish even if the channel was full when called");
     }
 }
