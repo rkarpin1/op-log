@@ -300,11 +300,9 @@ impl LogFile {
             f.write_all(MAGIC).await?;
 
             if !self.header.is_empty() {
-                bytes.put(self.header.as_bytes());
-                bytes.put_u8(0x0a);
-
-                encoder.write_all(&bytes)?;
-                bytes.clear();
+                encoder.write_all(self.header.as_bytes())?;
+                encoder.write_all(b"
+")?;
             }
 
             f
