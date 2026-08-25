@@ -120,36 +120,50 @@ impl OpLogWorker {
 
 #[cfg(test)]
 mod tests {
-    // A filename that isn't valid UTF-8 must not panic the shared worker
-    // task — it used to, via `.to_str().unwrap()` (see the diff this test
-    // was added alongside). Non-UTF-8 bytes in a filename are a Unix-only
-    // concept — OsStr on Windows can't carry arbitrary bytes the same way —
-    // so this only runs where the risk actually exists.
+    use super::OpLogWorker;
+    use std::ffi::OsString;
+
+    // A name the OS accepts but that is not valid UTF-8 — the case that used
+    // to panic the shared worker task via `.to_str().unwrap()`. Each platform
+    // produces one differently: arbitrary bytes on Unix, an unpaired UTF-16
+    // surrogate on Windows.
     #[cfg(unix)]
+    fn non_utf8_name() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        // "fo\xFFo" — 0xFF is never a valid UTF-8 byte.
+        OsString::from_vec(vec![0x66, 0x6f, 0xff, 0x6f])
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_name() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // "fo\u{D800}o" — a lone high surrogate has no UTF-8 encoding.
+        OsString::from_wide(&[0x66, 0x6f, 0xd800, 0x6f])
+    }
+
+    // The cleaner formats a path in two places: the directory it has just
+    // emptied and every subdirectory it removed — so the bad name must be a
+    // SUBDIRECTORY holding an old file, not just a file. `info!` evaluates
+    // its arguments only when the level is enabled, so enable it: otherwise
+    // even the old `.unwrap()` would never run here.
     #[tokio::test]
     async fn non_utf8_filename_does_not_panic_the_cleaner() {
-        use super::OpLogWorker;
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
+        log::set_max_level(log::LevelFilter::Info);
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let worker = OpLogWorker::new(rx);
 
         let dir = std::env::temp_dir().join(format!("op-log-test-{}", std::process::id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        // "fo\xFFo" — 0xFF is not a valid UTF-8 continuation or start byte.
-        let bad_name = OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f]);
-        let bad_path = dir.join(bad_name);
-        tokio::fs::write(&bad_path, b"x").await.unwrap();
+        let bad_dir = dir.join(non_utf8_name());
+        let bad_file = bad_dir.join(non_utf8_name());
+        tokio::fs::create_dir_all(&bad_dir).await.unwrap();
+        tokio::fs::write(&bad_file, b"x").await.unwrap();
+        assert!(bad_dir.to_str().is_none(), "the test premise needs a non-UTF-8 path");
 
         // delete_after_days: 0 makes every file eligible immediately.
         worker.delete_files_in_path(&dir, 0).await;
 
-        assert!(
-            !bad_path.exists(),
-            "file with a non-UTF-8 name should have been deleted without panicking"
-        );
+        assert!(!bad_file.exists(), "file with a non-UTF-8 name should have been deleted");
+        assert!(!bad_dir.exists(), "emptied directory with a non-UTF-8 name should be gone");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
