@@ -82,6 +82,10 @@ struct LogFile {
     /// True after a failed disk write was reported — keeps the error message
     /// to one per failure episode instead of one per writer tick.
     write_error_logged: bool,
+    /// True once the file on disk has been checked to end on a frame
+    /// boundary. Cleared by every failed write: an interrupted write may
+    /// have left a partial frame that must be cut before the next append.
+    tail_verified: bool,
 }
 
 struct LogCleanUpDefinition {

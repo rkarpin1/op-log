@@ -8,9 +8,11 @@ use bytes::{BufMut, BytesMut};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::random;
+use std::cmp::min;
 use std::io;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use log::info;
 use tokio::fs;
@@ -42,6 +44,91 @@ use tokio::time::timeout;
 /// out of scope for this fix.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Every log file starts with this line; frames follow it.
+const MAGIC: &[u8] = b"OPLog 1.0\n";
+
+/// Walks the frames of an existing log file and returns the offset of the
+/// frame the file ends in the middle of — the trace of a write that was
+/// cut short (no space left mid-payload, a crash between the prefix and the
+/// payload). Returns `None` when the file ends exactly on a frame boundary,
+/// and also when the layout is not one this walker understands (no magic,
+/// a byte other than the marker where a frame should start, an oversized
+/// size field): such a file is not ours to judge and is left untouched.
+fn truncated_frame_start<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<Option<u64>> {
+    if len < MAGIC.len() as u64 {
+        return Ok(None);
+    }
+    let mut magic = [0u8; MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != MAGIC {
+        return Ok(None);
+    }
+
+    let mut pos = MAGIC.len() as u64;
+    while pos < len {
+        // prefix: marker, rnd, checksum, then the size as a VLQ of up to
+        // five bytes (each XOR 0xC5)
+        let mut prefix = [0u8; 8];
+        let available = min(prefix.len() as u64, len - pos) as usize;
+        reader.read_exact(&mut prefix[..available])?;
+        if prefix[0] != 0xff {
+            return Ok(None);
+        }
+
+        let mut size = 0u64;
+        let mut shift = 0;
+        let mut i = 3;
+        loop {
+            if i >= available {
+                // the file ends inside the prefix
+                return Ok(Some(pos));
+            }
+            let b = prefix[i] ^ 0xc5;
+            i += 1;
+            size |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 28 {
+                return Ok(None);
+            }
+        }
+
+        let next = pos + i as u64 + size;
+        if next > len {
+            // the file ends inside the payload
+            return Ok(Some(pos));
+        }
+        reader.seek(SeekFrom::Start(next))?;
+        pos = next;
+    }
+    Ok(None)
+}
+
+/// Cuts an interrupted frame off the end of the file, if there is one, so
+/// that the next frame is appended on a frame boundary. Runs on the
+/// blocking pool: the walk is one seek per frame, far cheaper there than as
+/// a round trip through `tokio::fs` per frame.
+async fn cut_interrupted_tail(path: &Path) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::options().read(true).write(true).open(&path)?;
+        let len = file.metadata()?.len();
+        if let Some(cut) = truncated_frame_start(&mut file, len)? {
+            file.set_len(cut)?;
+            eprintln!(
+                "[op-log] {}: cut {} bytes of an interrupted frame before appending",
+                path.display(),
+                len - cut
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 impl LogDefinition {
     async fn write_to_file(&mut self, flush_interval: &Duration) {
         for file in self.files.values_mut() {
@@ -63,6 +150,7 @@ impl LogDefinition {
             match result {
                 Ok(()) => file.write_error_logged = false,
                 Err(e) => {
+                    file.tail_verified = false;
                     if !file.write_error_logged {
                         eprintln!(
                             "[op-log] write error for {}/{}: {e}",
@@ -148,11 +236,22 @@ impl LogFile {
         // appended to a file without its magic and readers reject it whole.
         let has_content = fs::metadata(&path).await.map(|m| m.len() > 0).unwrap_or(false);
         let mut f = if has_content {
+            // An earlier write may have been cut short (no space left in the
+            // middle of the payload, a crash between the prefix and the
+            // payload) and left the file ending inside a frame. Appending
+            // after that would make the whole file unreadable: readers
+            // recover a truncated LAST frame, but a truncated frame followed
+            // by more frames fails its checksum and takes every later frame
+            // down with it. Checked before the first write through this
+            // handle and again after every failed write.
+            if !self.tail_verified {
+                cut_interrupted_tail(&path).await?;
+            }
             File::options().append(true).open(&path).await?
         } else {
             let mut f = File::create(&path).await?;
 
-            f.write_all(b"OPLog 1.0\n").await?;
+            f.write_all(MAGIC).await?;
 
             if !self.header.is_empty() {
                 bytes.put(self.header.as_bytes());
@@ -245,6 +344,8 @@ impl LogFile {
         // that were actually encoded above — a timeout anywhere before this
         // line leaves them in `self.logs` for the next attempt.
         self.logs.drain(..consumed);
+        // The file now ends on the boundary of the frame just written.
+        self.tail_verified = true;
 
         if self.logs.is_empty() {
             self.time_of_first_addition_of_log_after_write = None;
@@ -438,10 +539,114 @@ mod tests {
         assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
         assert!(!queued_file(&op_log).write_error_logged, "a successful write must close the episode");
 
-        let raw = std::fs::read(log_dir.join("test.log")).unwrap();
+        let file = log_dir.join("test.log");
+        let raw = std::fs::read(&file).unwrap();
         assert_eq!(decode_oplog_file(&raw), vec!["entry\n".to_string()]);
+        assert!(queued_file(&op_log).tail_verified, "a successful write leaves the tail verified");
+
+        // a failure AFTER a success: a directory in place of the log file
+        // fails the write on every platform; the failure must invalidate
+        // the tail check, since an interrupted write may have left a
+        // partial frame behind
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        op_log.log("test", Utc::now(), "later");
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
+        assert!(!queued_file(&op_log).tail_verified, "a failed write must invalidate the tail check");
+
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, &raw).unwrap();
+        op_log.write_to_files().await;
+        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
+        assert!(queued_file(&op_log).tail_verified, "a successful write leaves the tail verified");
+        let raw = std::fs::read(&file).unwrap();
+        assert_eq!(decode_oplog_file(&raw), vec!["entry\n".to_string(), "later\n".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A write cut short — no space left in the middle of the payload, a
+    // crash between the prefix and the payload — leaves the file ending
+    // inside a frame. Readers recover a truncated LAST frame, but once more
+    // frames are appended after it, the truncated frame's declared size
+    // swallows the following bytes, its checksum fails and the whole file
+    // is rejected. A fresh writer must therefore cut the file back to the
+    // last frame boundary before appending; a file that ends on a boundary
+    // must be appended to untouched.
+    #[tokio::test]
+    async fn interrupted_frame_at_the_tail_is_cut_before_appending() {
+        let dir = temp_dir("tail");
+        let path = dir.join("test.log");
+
+        let mut op_log = worker_with_no_split_definition(&dir, "");
+        op_log.log("test", Utc::now(), "first");
+        op_log.flush().await;
+        let len1 = std::fs::metadata(&path).unwrap().len();
+        op_log.log("test", Utc::now(), "second");
+        op_log.flush().await;
+        let clean = std::fs::read(&path).unwrap();
+        let frame2 = clean.len() as u64 - len1;
+        assert!(frame2 > 8, "the second frame must allow cuts inside its prefix and its payload");
+
+        // bytes of the second frame kept on disk — the whole frame (no cut),
+        // 1..=4 (cut inside the prefix: marker, rnd, checksum, size), and
+        // cuts inside the payload
+        for kept in [frame2, 1, 2, 3, 4, frame2 / 2, frame2 - 1] {
+            std::fs::write(&path, &clean[..(len1 + kept) as usize]).unwrap();
+
+            let mut fresh = worker_with_no_split_definition(&dir, "");
+            fresh.log("test", Utc::now(), "third");
+            fresh.flush().await;
+            assert_eq!(fresh.log_count(), 0, "kept={kept}: the write must succeed");
+
+            let raw = std::fs::read(&path).unwrap();
+            let expected: Vec<String> = if kept == frame2 {
+                vec!["first\n".into(), "second\n".into(), "third\n".into()]
+            } else {
+                vec!["first\n".into(), "third\n".into()]
+            };
+            assert_eq!(decode_oplog_file(&raw), expected, "kept={kept} of {frame2}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The walker may only report a cut for a file it fully understands up to
+    // the truncated frame. Anything else — no magic, a byte other than the
+    // marker where a frame should start — must be left alone: cutting a file
+    // whose layout is unknown would destroy data instead of repairing it.
+    #[test]
+    fn tail_walker_leaves_unrecognised_layouts_alone() {
+        let walk = |bytes: &[u8]| {
+            let mut cursor = std::io::Cursor::new(bytes.to_vec());
+            super::truncated_frame_start(&mut cursor, bytes.len() as u64).unwrap()
+        };
+        let magic = b"OPLog 1.0\n".as_slice();
+        // marker, rnd, checksum, size 2 (VLQ 0x02 ^ 0xC5), two payload bytes
+        let frame = [0xff, 0x01, 0x02, 0x02 ^ 0xc5, 0xaa, 0xbb].as_slice();
+
+        assert_eq!(walk(b""), None);
+        assert_eq!(walk(b"plain text, not a log\n"), None);
+        assert_eq!(walk(magic), None, "magic only: nothing to cut");
+        assert_eq!(walk(&[magic, b"XYZ"].concat()), None, "bad marker: not ours to judge");
+        assert_eq!(walk(&[magic, frame].concat()), None, "complete frame: nothing to cut");
+        assert_eq!(walk(&[magic, frame, frame].concat()), None, "two complete frames");
+        assert_eq!(
+            walk(&[magic, frame, b"garbage"].concat()),
+            None,
+            "a good frame followed by a bad marker: not ours to judge"
+        );
+        assert_eq!(
+            walk(&[magic, frame, &frame[..5]].concat()),
+            Some((magic.len() + frame.len()) as u64),
+            "the second frame is short of its last byte"
+        );
+        assert_eq!(
+            walk(&[magic, &frame[..2]].concat()),
+            Some(magic.len() as u64),
+            "the only frame ends inside its prefix"
+        );
     }
 
     // Pins the constant's value: a future change to the ceiling must be a
