@@ -23,9 +23,8 @@ impl OpLogWorker {
 #[cfg(test)]
 mod tests {
     use crate::OpLogWorker;
-    use crate::messages::OpLogType;
+    use crate::messages::{OpLogDefinition, OpLogType};
     use chrono::Utc;
-    use std::collections::HashSet;
     use std::time::Duration;
 
     const IDLE: Duration = Duration::from_secs(11 * 60);
@@ -34,13 +33,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut worker = OpLogWorker::new(rx);
         worker.def(
-            "quiet",
-            ".",
-            OpLogType::PerDay,
-            &HashSet::new(),
-            Duration::from_secs(1),
-            "",
-            auto_remove_definition,
+            OpLogDefinition::new("quiet", ".")
+                .log_type(OpLogType::PerDay)
+                .flush_interval(Duration::from_secs(1))
+                .auto_remove_definition(auto_remove_definition),
         );
         worker
     }

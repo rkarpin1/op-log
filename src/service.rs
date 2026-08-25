@@ -2,7 +2,7 @@
 //   Copyright 2024-2025 (c) Robert Karpiński
 // -------------------------------------------------------------------------------------------------
 
-use crate::messages::{OpLogBundle, OpLogData, OpLogDefinition, OpLogMessage};
+use crate::messages::{OpLogBundle, OpLogData, OpLogMessage};
 use crate::OpLogWorker;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
@@ -28,8 +28,8 @@ impl OpLogWorker {
                         Some(OpLogMessage::StopService) => break,
                         Some(OpLogMessage::Flush) => self.flush().await,
                         Some(OpLogMessage::GetInfoAndFlush(sender)) => self.get_info_and_flush(sender).await,
-                        Some(OpLogMessage::LogBundle(bundle)) => self.process_bundle(&bundle),
-                        Some(OpLogMessage::LogDefinition(def)) => self.process_definition(&def),
+                        Some(OpLogMessage::LogBundle(bundle)) => self.process_bundle(bundle),
+                        Some(OpLogMessage::LogDefinition(def)) => self.def(def),
                         Some(OpLogMessage::Log(log)) => self.process_log(&log),
                         Some(OpLogMessage::CleanUpRemoveAllDefinitions) => {
                             self.clean_up_remove_all_definitions()
@@ -44,25 +44,10 @@ impl OpLogWorker {
         self.flush().await;
     }
 
-    fn process_bundle(&mut self, bundle: &OpLogBundle) {
-        bundle
-            .definitions
-            .iter()
-            .for_each(|def| self.process_definition(def));
+    fn process_bundle(&mut self, bundle: OpLogBundle) {
+        bundle.definitions.into_iter().for_each(|def| self.def(def));
 
         bundle.logs.iter().for_each(|log| self.process_log(log));
-    }
-
-    fn process_definition(&mut self, def: &OpLogDefinition) {
-        self.def(
-            def.log_name.as_str(),
-            def.path.as_str(),
-            def.log_type,
-            &def.options,
-            def.flush_interval,
-            def.header.as_str(),
-            def.auto_remove_definition,
-        )
     }
 
     fn process_log(&mut self, log: &OpLogData) {

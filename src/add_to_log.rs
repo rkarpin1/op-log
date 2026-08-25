@@ -3,12 +3,11 @@
 // -------------------------------------------------------------------------------------------------
 
 use crate::{LogDefinition, LogFile, OpLogWorker};
-use crate::messages::{OpLogOption, OpLogType};
+use crate::messages::{OpLogDefinition, OpLogOption, OpLogType};
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Warsaw;
 use chrono_tz::Tz;
-use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use tokio::time::Instant;
 
 fn format_date_in_log<'a>(log_type: &OpLogType) -> &'a str {
@@ -55,35 +54,35 @@ fn format_date_in_path<'a>(log_type: &OpLogType) -> &'a str {
 }
 
 impl OpLogWorker {
-    pub(crate) fn def(
-        &mut self,
-        log_name: &str,
-        path: &str,
-        log_type: OpLogType,
-        options: &HashSet<OpLogOption>,
-        flush_interval: Duration,
-        header: &str,
-        auto_remove_definition: bool,
-    ) {
-        match self.definitions.entry(log_name.to_string()) {
+    pub(crate) fn def(&mut self, def: OpLogDefinition) {
+        let OpLogDefinition {
+            log_name,
+            log_type,
+            header,
+            path,
+            options,
+            flush_interval,
+            auto_remove_definition,
+        } = def;
+        match self.definitions.entry(log_name) {
             Entry::Occupied(mut e) => {
                 let file = e.get_mut();
-                file.path = path.to_string();
+                file.path = path;
                 file.log_type = log_type;
-                file.options = options.clone();
+                file.options = options;
                 file.flush_interval = flush_interval;
-                file.header = header.to_string();
+                file.header = header;
                 file.auto_remove_definition = auto_remove_definition;
             }
             Entry::Vacant(e) => {
                 e.insert(LogDefinition {
                     last_time_use: Instant::now(),
                     auto_remove_definition,
-                    path: path.to_string(),
+                    path,
                     flush_interval,
                     log_type,
-                    options: options.clone(),
-                    header: header.to_string(),
+                    options,
+                    header,
                     files: HashMap::new(),
                 });
             }
@@ -179,20 +178,18 @@ impl LogDefinition {
 mod tests {
     use super::QUEUE_MAX_BYTES;
     use crate::OpLogWorker;
-    use crate::messages::{OpLogOption, OpLogType};
+    use crate::messages::{OpLogDefinition, OpLogOption, OpLogType};
     use chrono::Utc;
     use std::collections::HashSet;
     use std::time::Duration;
 
     fn define(worker: &mut OpLogWorker, options: &HashSet<OpLogOption>, auto_remove: bool) {
         worker.def(
-            "app",
-            "logs",
-            OpLogType::PerDay,
-            options,
-            Duration::from_secs(1),
-            "",
-            auto_remove,
+            OpLogDefinition::new("app", "logs")
+                .log_type(OpLogType::PerDay)
+                .options(options.clone())
+                .flush_interval(Duration::from_secs(1))
+                .auto_remove_definition(auto_remove),
         );
     }
 

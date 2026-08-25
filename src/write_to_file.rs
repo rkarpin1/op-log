@@ -406,9 +406,8 @@ impl LogFile {
 #[cfg(test)]
 mod tests {
     use crate::OpLogWorker;
-    use crate::messages::OpLogType;
+    use crate::messages::{OpLogDefinition, OpLogType};
     use chrono::Utc;
-    use std::collections::HashSet;
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -432,13 +431,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(32);
         let mut worker = OpLogWorker::new(rx);
         worker.def(
-            "test",
-            dir.to_str().unwrap(),
-            OpLogType::NoSplit,
-            &HashSet::new(),
-            flush_interval,
-            header,
-            false,
+            OpLogDefinition::new("test", dir.to_str().unwrap())
+                .log_type(OpLogType::NoSplit)
+                .flush_interval(flush_interval)
+                .header(header),
         );
         worker
     }
