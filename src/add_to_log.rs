@@ -44,8 +44,10 @@ impl OpLogWorker {
                 let file = e.get_mut();
                 file.path = path.to_string();
                 file.log_type = log_type;
+                file.options = options.clone();
                 file.flush_interval = flush_interval;
                 file.header = header.to_string();
+                file.auto_remove_definition = auto_remove_definition;
             }
             Entry::Vacant(e) => {
                 e.insert(LogDefinition {
@@ -136,5 +138,52 @@ impl LogDefinition {
         }
 
         log_file.logs.push_back(log);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::OpLogWorker;
+    use crate::messages::{OpLogOption, OpLogType};
+    use chrono::Utc;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    fn define(worker: &mut OpLogWorker, options: &HashSet<OpLogOption>, auto_remove: bool) {
+        worker.def(
+            "app",
+            "logs",
+            OpLogType::PerDay,
+            options,
+            Duration::from_secs(1),
+            "",
+            auto_remove,
+        );
+    }
+
+    // `def()` on an existing name is documented as an update: every field of
+    // the definition must follow the latest call, not just some of them.
+    #[tokio::test]
+    async fn redefining_updates_options_and_auto_remove() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut worker = OpLogWorker::new(rx);
+        define(&mut worker, &HashSet::from([OpLogOption::UseSubDirectories]), false);
+        define(&mut worker, &HashSet::new(), true);
+
+        let def = &worker.definitions["app"];
+        assert!(def.options.is_empty(), "options must follow the latest definition");
+        assert!(
+            def.auto_remove_definition,
+            "auto_remove_definition must follow the latest definition"
+        );
+
+        worker.log("app", Utc::now(), "entry");
+        let keys: Vec<&String> = worker.definitions["app"].files.keys().collect();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].starts_with("logs/app_"),
+            "without UseSubDirectories the date belongs in the file name: {}",
+            keys[0]
+        );
     }
 }
