@@ -95,14 +95,9 @@ struct LogFile {
     tail_verified: bool,
 }
 
-struct LogCleanUpDefinition {
-    path: String,
-    delete_after_days: u32,
-}
-
 struct OpLogWorker {
     definitions: HashMap<String, LogDefinition>,
-    clean_up_definitions: Vec<LogCleanUpDefinition>,
+    clean_up_definitions: Vec<OpLogCleanUpDefinition>,
     rx_channel: Receiver<OpLogMessage>,
     /// True after a file-cleanup pass was cut off by `CLEANUP_TIMEOUT` and
     /// reported — keeps the message to one per episode, not one per tick.

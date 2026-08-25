@@ -3,7 +3,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use crate::messages::OpLogCleanUpDefinition;
-use crate::{LogCleanUpDefinition, OpLogWorker};
+use crate::OpLogWorker;
 use log::info;
 use std::cmp::min;
 use std::future::Future;
@@ -54,13 +54,7 @@ impl OpLogWorker {
     }
 
     pub(crate) fn clean_up_bundle(&mut self, bundle: Vec<OpLogCleanUpDefinition>) {
-        self.clean_up_definitions = bundle
-            .into_iter()
-            .map(|d| LogCleanUpDefinition {
-                path: d.path,
-                delete_after_days: d.delete_after_days,
-            })
-            .collect();
+        self.clean_up_definitions = bundle;
     }
 
     pub(crate) fn clean_up_definition(&mut self, def: OpLogCleanUpDefinition) {
@@ -72,10 +66,7 @@ impl OpLogWorker {
         if let Some(a) = a {
             a.delete_after_days = def.delete_after_days;
         } else {
-            self.clean_up_definitions.push(LogCleanUpDefinition {
-                path: def.path.clone(),
-                delete_after_days: def.delete_after_days,
-            })
+            self.clean_up_definitions.push(def)
         }
     }
 
