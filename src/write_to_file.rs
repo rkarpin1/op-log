@@ -338,9 +338,8 @@ impl LogFile {
             if bytes.is_empty() {
                 break;
             }
-            let b = bytes.split();
 
-            encoder.write_all(&b)?;
+            encoder.write_all(&bytes)?;
             if encoder.get_ref().len() > 2 * 1024 * 1024 {
                 break;
             }
