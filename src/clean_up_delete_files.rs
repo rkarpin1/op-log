@@ -117,3 +117,40 @@ impl OpLogWorker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // A filename that isn't valid UTF-8 must not panic the shared worker
+    // task — it used to, via `.to_str().unwrap()` (see the diff this test
+    // was added alongside). Non-UTF-8 bytes in a filename are a Unix-only
+    // concept — OsStr on Windows can't carry arbitrary bytes the same way —
+    // so this only runs where the risk actually exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_filename_does_not_panic_the_cleaner() {
+        use super::OpLogWorker;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let worker = OpLogWorker::new(rx);
+
+        let dir = std::env::temp_dir().join(format!("op-log-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // "fo\xFFo" — 0xFF is not a valid UTF-8 continuation or start byte.
+        let bad_name = OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f]);
+        let bad_path = dir.join(bad_name);
+        tokio::fs::write(&bad_path, b"x").await.unwrap();
+
+        // delete_after_days: 0 makes every file eligible immediately.
+        worker.delete_files_in_path(&dir, 0).await;
+
+        assert!(
+            !bad_path.exists(),
+            "file with a non-UTF-8 name should have been deleted without panicking"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+}

@@ -19,14 +19,27 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-/// Sufit czasu na pojedynczy zapis pliku (create_dir_all + open + write + flush).
-/// Bez tego, zawieszony syscall (np. chwilowe zacięcie wolumenu) blokuje
-/// `.await` w nieskończoność — a to jest jedyny wspólny task obsługujący
-/// WSZYSTKIE zdefiniowane logi naraz, więc jego zawieszenie ubija logowanie
-/// na stałe, do restartu procesu. Zmierzone jako przyczyna 10-dniowej przerwy
-/// w logach w konsumencie tej biblioteki (x-ai, incydent 2026-08-15..08-25):
-/// proces żył, dysk miał miejsce, brak paniki w journalu — worker po prostu
-/// nigdy nie wrócił z jednego `.await`.
+/// Ceiling on a single file write (create_dir_all + open + write + flush).
+/// Without this, a stuck syscall (e.g. a volume that briefly wedges) blocks
+/// the `.await` forever — and this is the ONE shared task handling every
+/// defined log at once, so its hang kills logging for good, until the
+/// process is restarted. Measured as the cause of a 10-day logging outage
+/// in a consumer of this library (x-ai, incident 2026-08-15..08-25): the
+/// process stayed up, the disk had room, no panic in the journal — the
+/// worker simply never came back from one `.await`.
+///
+/// Residual risk, accepted deliberately: `tokio::time::timeout` does not
+/// cancel the underlying blocking-pool task, it only stops waiting on it.
+/// A timed-out write may still complete later, in the background, and could
+/// in principle interleave with a subsequent attempt's append to the same
+/// path — the on-disk format is a sequential stream of length-prefixed
+/// frames, so an interleaved write could corrupt everything from that point
+/// on. This is judged acceptable: it trades an unmeasured, narrow-window
+/// risk for the certainty of the alternative (the worker hangs forever,
+/// exactly as measured above). Closing it fully would mean rotating to a
+/// fresh file after every timeout, which changes the on-disk file layout
+/// that downstream decoders (e.g. the `emi-oplog` reader) rely on — judged
+/// out of scope for this fix.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LogDefinition {
@@ -147,16 +160,22 @@ impl LogFile {
             f
         };
 
+        // Encode by INDEX, not by draining `self.logs` — the disk write below
+        // can still be interrupted by the caller's `tokio::time::timeout`. If
+        // entries were popped here, a timed-out write would lose them for
+        // good (they'd exist only in `bytes`/`encoder`, dropped with the
+        // future). Only remove what was actually written once the write
+        // below has succeeded (see `self.logs.drain(..consumed)` further
+        // down) — a timeout before that point leaves `self.logs` untouched,
+        // so the next tick retries the same entries in full.
+        let mut consumed = 0usize;
         loop {
             bytes.clear();
 
-            loop {
-                if self.logs.is_empty() {
-                    break;
-                }
-                let log = self.logs.pop_front().unwrap();
+            while let Some(log) = self.logs.get(consumed) {
                 bytes.put(log.as_bytes());
                 bytes.put_u8(0x0a);
+                consumed += 1;
 
                 if bytes.len() > 64000 {
                     break;
@@ -217,6 +236,11 @@ impl LogFile {
         f.write_all(&a).await?;
         f.flush().await?;
 
+        // Only now, after the write is confirmed on disk, drop the entries
+        // that were actually encoded above — a timeout anywhere before this
+        // line leaves them in `self.logs` for the next attempt.
+        self.logs.drain(..consumed);
+
         if self.logs.is_empty() {
             self.time_of_first_addition_of_log_after_write = None;
         }
@@ -259,17 +283,17 @@ mod tests {
         op_log.flush().await;
     }
 
-    // Przypina wartość stałej: przyszła zmiana sufitu ma być świadomą
-    // decyzją, nie przypadkowym skutkiem refaktoru.
+    // Pins the constant's value: a future change to the ceiling must be a
+    // deliberate decision, not an accidental side effect of a refactor.
     #[test]
     fn write_timeout_constant_matches_documented_value() {
         assert_eq!(super::WRITE_TIMEOUT, Duration::from_secs(15));
     }
 
-    // Symuluje zawieszony syscall zapisu: future, która nigdy się nie kończy.
-    // Prawdziwego zawieszonego dysku nie da się deterministycznie zasymulować
-    // bez mockowania systemu plików — to sprawdza sam mechanizm, na którym
-    // stoi cała poprawka, z krótkim lokalnym czasem, żeby test pozostał szybki.
+    // Simulates a stuck write syscall: a future that never completes. A
+    // genuinely stuck disk can't be simulated deterministically without
+    // mocking the filesystem — this checks the mechanism the whole fix
+    // relies on, with a short local duration so the test stays fast.
     #[tokio::test]
     async fn timeout_wraps_a_stuck_operation_and_errors_out() {
         let stuck = std::future::pending::<std::io::Result<()>>();
