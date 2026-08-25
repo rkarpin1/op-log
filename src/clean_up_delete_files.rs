@@ -87,12 +87,9 @@ impl OpLogWorker {
     }
 
     async fn delete_files_in_path(&self, path: &Path, delete_after_days: u32) {
-        let dir = read_dir(path).await;
-        if dir.is_err() {
+        let Ok(mut dir) = read_dir(path).await else {
             return;
-        }
-
-        let mut dir = dir.unwrap();
+        };
         let mut deleted_count = 0;
 
         loop {
