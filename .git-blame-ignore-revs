@@ -1,0 +1,7 @@
+# Revisions to skip when running `git blame`: bulk reformatting, no logic.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub and GitLab honour this file automatically.)
+
+# Adopt rustfmt and reformat the crate
+360bc969b02113897bf97f5805d5071c007e87b8
