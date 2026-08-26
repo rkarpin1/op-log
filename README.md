@@ -82,6 +82,17 @@ let def = OpLogDefinition::new("my_log", "/path/to/logs")
     .options(HashSet::from([OpLogOption::UseSubDirectories]));
 ```
 
+> **The paths a definition writes to belong to op-log.** A non-empty file at a
+> log's path is appended to as if it were an op-log file: the worker checks
+> whether it ends mid-block and then writes its next block at the end. Point a
+> definition at a file written by anything else — a plain-text log kept under
+> the same name, for instance — and the result is a file that is neither
+> readable as text nor decodable as `OPLog 1.0`, and the entries in that write
+> are counted as written and dropped from the queue. Give each definition a
+> path (and a `log_name`) nothing else writes to. The same applies to the
+> cleanup rules below, which delete by age everything under the path they are
+> given.
+
 ### File split types (`OpLogType`)
 
 | Type | File name |
