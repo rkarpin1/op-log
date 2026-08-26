@@ -2,14 +2,14 @@
 //   Copyright 2024-2025 (c) Robert Karpiński
 // -------------------------------------------------------------------------------------------------
 
-use crate::messages::OpLogCleanUpDefinition;
 use crate::OpLogWorker;
+use crate::messages::OpLogCleanUpDefinition;
 use log::info;
 use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::fs::remove_dir;
-use tokio::fs::{read_dir, remove_file, DirEntry};
+use tokio::fs::{DirEntry, read_dir, remove_file};
 use tokio::io;
 use tokio::time::timeout;
 
@@ -161,10 +161,10 @@ impl OpLogWorker {
 #[cfg(test)]
 mod tests {
     use super::OpLogWorker;
-    use std::time::SystemTime;
-    use tokio::io;
     use std::ffi::OsString;
     use std::time::Duration;
+    use std::time::SystemTime;
+    use tokio::io;
 
     // A name the OS accepts but that is not valid UTF-8 — the case that used
     // to panic the shared worker task via `.to_str().unwrap()`. Each platform
@@ -200,13 +200,22 @@ mod tests {
         let bad_file = bad_dir.join(non_utf8_name());
         tokio::fs::create_dir_all(&bad_dir).await.unwrap();
         tokio::fs::write(&bad_file, b"x").await.unwrap();
-        assert!(bad_dir.to_str().is_none(), "the test premise needs a non-UTF-8 path");
+        assert!(
+            bad_dir.to_str().is_none(),
+            "the test premise needs a non-UTF-8 path"
+        );
 
         // delete_after_days: 0 makes every file eligible immediately.
         worker.delete_files_in_path(&dir, 0).await;
 
-        assert!(!bad_file.exists(), "file with a non-UTF-8 name should have been deleted");
-        assert!(!bad_dir.exists(), "emptied directory with a non-UTF-8 name should be gone");
+        assert!(
+            !bad_file.exists(),
+            "file with a non-UTF-8 name should have been deleted"
+        );
+        assert!(
+            !bad_dir.exists(),
+            "emptied directory with a non-UTF-8 name should be gone"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -225,8 +234,15 @@ mod tests {
     async fn stuck_cleanup_pass_is_cut_off_at_the_ceiling() {
         let started = tokio::time::Instant::now();
         let completed = super::run_bounded(std::future::pending::<()>()).await;
-        assert!(!completed, "a pass that never finishes must be reported as cut off");
-        assert_eq!(started.elapsed(), super::CLEANUP_TIMEOUT, "cut off exactly at the ceiling");
+        assert!(
+            !completed,
+            "a pass that never finishes must be reported as cut off"
+        );
+        assert_eq!(
+            started.elapsed(),
+            super::CLEANUP_TIMEOUT,
+            "cut off exactly at the ceiling"
+        );
 
         let completed = super::run_bounded(async {}).await;
         assert!(completed, "a finished pass must not be reported as cut off");
@@ -240,11 +256,20 @@ mod tests {
         let mut worker = OpLogWorker::new(rx);
 
         worker.note_cleanup_outcome(false);
-        assert!(worker.cleanup_timed_out, "the first cut-off opens an episode");
+        assert!(
+            worker.cleanup_timed_out,
+            "the first cut-off opens an episode"
+        );
         worker.note_cleanup_outcome(false);
-        assert!(worker.cleanup_timed_out, "a repeated cut-off keeps the episode open");
+        assert!(
+            worker.cleanup_timed_out,
+            "a repeated cut-off keeps the episode open"
+        );
         worker.note_cleanup_outcome(true);
-        assert!(!worker.cleanup_timed_out, "a completed pass closes the episode");
+        assert!(
+            !worker.cleanup_timed_out,
+            "a completed pass closes the episode"
+        );
     }
 
     // Retention counts days since the file was last WRITTEN, not since it
@@ -317,8 +342,14 @@ mod tests {
 
         worker.delete_files_in_path(&dir, 30).await;
 
-        assert!(!stale.exists(), "a file unwritten for 40 days must be deleted at 30");
-        assert!(active.exists(), "a file written just now must survive, though it is as new as the other");
+        assert!(
+            !stale.exists(),
+            "a file unwritten for 40 days must be deleted at 30"
+        );
+        assert!(
+            active.exists(),
+            "a file written just now must survive, though it is as new as the other"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

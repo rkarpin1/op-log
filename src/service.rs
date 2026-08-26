@@ -2,10 +2,10 @@
 //   Copyright 2024-2025 (c) Robert Karpiński
 // -------------------------------------------------------------------------------------------------
 
-use crate::messages::{OpLogBundle, OpLogData, OpLogMessage};
 use crate::OpLogWorker;
+use crate::messages::{OpLogBundle, OpLogData, OpLogMessage};
 use std::time::Duration;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 
 impl OpLogWorker {
     pub(crate) async fn run(&mut self) {

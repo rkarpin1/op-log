@@ -2,13 +2,13 @@
 //   Copyright 2024-2025 (c) Robert Karpiński
 // -------------------------------------------------------------------------------------------------
 
-use crate::{LogDefinition, LogFile, OpLogWorker};
 use crate::messages::{OpLogDefinition, OpLogOption, OpLogType};
+use crate::{LogDefinition, LogFile, OpLogWorker};
 use chrono::format::{Fixed, Item, Numeric, Pad};
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Warsaw;
 use chrono_tz::Tz;
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use tokio::time::Instant;
 
 // The date formats below are the `strftime` strings "%H:%M:%S.%3f",
@@ -106,7 +106,9 @@ pub(crate) fn format_entry(
 /// Appends `date` formatted with `format` to `out`. The formats used here
 /// are constants without an error item, so the formatting cannot fail.
 fn write_date(out: &mut String, date: &DateTime<Tz>, format: &[Item<'static>]) {
-    date.format_with_items(format.iter()).write_to(out).expect("constant date format")
+    date.format_with_items(format.iter())
+        .write_to(out)
+        .expect("constant date format")
 }
 
 fn format_date_in_path(log_type: &OpLogType) -> &'static [Item<'static>] {
@@ -268,7 +270,11 @@ mod tests {
     async fn no_add_date_option_leaves_the_entry_without_timestamp() {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut worker = OpLogWorker::new(rx);
-        define(&mut worker, &HashSet::from([OpLogOption::NoAddDateToLog]), false);
+        define(
+            &mut worker,
+            &HashSet::from([OpLogOption::NoAddDateToLog]),
+            false,
+        );
 
         worker.log("app", Utc::now(), "entry without a timestamp");
 
@@ -304,10 +310,19 @@ mod tests {
             file.logs.iter().map(String::len).sum::<usize>(),
             "the byte count must match the queue"
         );
-        assert_eq!(file.dropped_logs, 3, "three 1 MB entries plus prefixes exceed 8 MB");
+        assert_eq!(
+            file.dropped_logs, 3,
+            "three 1 MB entries plus prefixes exceed 8 MB"
+        );
         assert_eq!(file.logs.len(), 7);
-        assert!(file.logs.front().unwrap().contains(" 3:"), "the oldest entries go first");
-        assert!(file.logs.back().unwrap().contains(" 9:"), "the newest entry always survives");
+        assert!(
+            file.logs.front().unwrap().contains(" 3:"),
+            "the oldest entries go first"
+        );
+        assert!(
+            file.logs.back().unwrap().contains(" 9:"),
+            "the newest entry always survives"
+        );
     }
 
     // `def()` on an existing name is documented as an update: every field of
@@ -316,11 +331,18 @@ mod tests {
     async fn redefining_updates_options_and_auto_remove() {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut worker = OpLogWorker::new(rx);
-        define(&mut worker, &HashSet::from([OpLogOption::UseSubDirectories]), false);
+        define(
+            &mut worker,
+            &HashSet::from([OpLogOption::UseSubDirectories]),
+            false,
+        );
         define(&mut worker, &HashSet::new(), true);
 
         let def = &worker.definitions["app"];
-        assert!(def.options.is_empty(), "options must follow the latest definition");
+        assert!(
+            def.options.is_empty(),
+            "options must follow the latest definition"
+        );
         assert!(
             def.auto_remove_definition,
             "auto_remove_definition must follow the latest definition"

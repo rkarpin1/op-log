@@ -7,8 +7,9 @@ use crate::messages::{OpLogInfo, OpLogOption};
 use crate::{LogDefinition, LogFile, OpLogWorker};
 use chrono::Utc;
 use chrono_tz::Europe::Warsaw;
-use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use log::info;
 use rand::random;
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -16,9 +17,8 @@ use std::io;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use log::info;
 use tokio::fs;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -170,7 +170,12 @@ impl LogDefinition {
                     "[op-log] dropped {} log entries (write backlog)",
                     file.dropped_logs
                 );
-                format_entry(&log_type, no_date, &Utc::now().with_timezone(&Warsaw), &text)
+                format_entry(
+                    &log_type,
+                    no_date,
+                    &Utc::now().with_timezone(&Warsaw),
+                    &text,
+                )
             });
 
             // A disk error (no space, revoked permissions) must not kill the
@@ -208,7 +213,11 @@ impl LogDefinition {
 
 impl OpLogWorker {
     fn log_count(&self) -> usize {
-        self.definitions.values().flat_map(|d| d.files.values()).map(|f| f.logs.len()).sum()
+        self.definitions
+            .values()
+            .flat_map(|d| d.files.values())
+            .map(|f| f.logs.len())
+            .sum()
     }
 
     pub(crate) async fn write_to_files(&mut self) {
@@ -370,7 +379,10 @@ impl LogFile {
         // the magic) — a crash or a full disk right after `File::create`
         // leaves exactly that behind. Treat it as new, otherwise frames get
         // appended to a file without its magic and readers reject it whole.
-        let has_content = fs::metadata(&path).await.map(|m| m.len() > 0).unwrap_or(false);
+        let has_content = fs::metadata(&path)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
         let mut f = if has_content {
             // An earlier write may have been cut short (no space left in the
             // middle of the payload, a crash between the prefix and the
@@ -491,14 +503,34 @@ mod tests {
         queued_file_mut(&mut op_log).dropped_logs = 3;
 
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
-        assert_eq!(queued_file(&op_log).dropped_logs, 3, "a failed write must keep the drop count");
+        assert_eq!(
+            op_log.log_count(),
+            1,
+            "a failed write must keep the entry queued"
+        );
+        assert_eq!(
+            queued_file(&op_log).dropped_logs,
+            3,
+            "a failed write must keep the drop count"
+        );
 
         std::fs::remove_file(&blocker).unwrap();
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
-        assert_eq!(queued_file(&op_log).dropped_logs, 0, "a successful write reports and clears the count");
-        assert_eq!(queued_file(&op_log).queued_bytes, 0, "the byte count must follow the drain");
+        assert_eq!(
+            op_log.log_count(),
+            0,
+            "the first successful write must drain the queue"
+        );
+        assert_eq!(
+            queued_file(&op_log).dropped_logs,
+            0,
+            "a successful write reports and clears the count"
+        );
+        assert_eq!(
+            queued_file(&op_log).queued_bytes,
+            0,
+            "the byte count must follow the drain"
+        );
 
         let raw = std::fs::read(log_dir.join("test.log")).unwrap();
         assert_eq!(
@@ -528,7 +560,10 @@ mod tests {
     fn decode_oplog_file(raw: &[u8]) -> Vec<String> {
         const MAGIC: &[u8] = b"OPLog 1.0
 ";
-        assert!(raw.starts_with(MAGIC), "file must start with the OPLog 1.0 magic");
+        assert!(
+            raw.starts_with(MAGIC),
+            "file must start with the OPLog 1.0 magic"
+        );
         let mut pos = MAGIC.len();
         let mut blocks = Vec::new();
         while pos < raw.len() {
@@ -585,9 +620,14 @@ mod tests {
         assert_eq!(op_log.log_count(), 0, "flush must drain the queue");
 
         let raw = std::fs::read(dir.join("test.log")).unwrap();
-        assert_eq!(decode_oplog_file(&raw), vec![format!("{header}
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec![format!(
+                "{header}
 {entry}
-")]);
+"
+            )]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -606,17 +646,28 @@ mod tests {
         op_log.log("test", Utc::now(), "first");
         op_log.flush().await;
         let raw = std::fs::read(dir.join("test.log")).unwrap();
-        assert_eq!(decode_oplog_file(&raw), vec!["first
-".to_string()]);
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec![
+                "first
+"
+                .to_string()
+            ]
+        );
 
         op_log.log("test", Utc::now(), "second");
         op_log.flush().await;
         let raw = std::fs::read(dir.join("test.log")).unwrap();
         assert_eq!(
             decode_oplog_file(&raw),
-            vec!["first
-".to_string(), "second
-".to_string()],
+            vec![
+                "first
+"
+                .to_string(),
+                "second
+"
+                .to_string()
+            ],
             "a non-empty file must be appended to"
         );
 
@@ -642,23 +693,44 @@ mod tests {
 
         // one writer tick: the write fails, the entry survives, the episode is open
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
-        assert!(queued_file(&op_log).write_error_logged, "the failure must open an error episode");
+        assert_eq!(
+            op_log.log_count(),
+            1,
+            "a failed write must keep the entry queued"
+        );
+        assert!(
+            queued_file(&op_log).write_error_logged,
+            "the failure must open an error episode"
+        );
 
         // a second failing tick must not lose the entry either
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 1, "repeated failures must keep the entry queued");
+        assert_eq!(
+            op_log.log_count(),
+            1,
+            "repeated failures must keep the entry queued"
+        );
 
         // the cause is gone: the next tick writes and closes the episode
         std::fs::remove_file(&blocker).unwrap();
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
-        assert!(!queued_file(&op_log).write_error_logged, "a successful write must close the episode");
+        assert_eq!(
+            op_log.log_count(),
+            0,
+            "the first successful write must drain the queue"
+        );
+        assert!(
+            !queued_file(&op_log).write_error_logged,
+            "a successful write must close the episode"
+        );
 
         let file = log_dir.join("test.log");
         let raw = std::fs::read(&file).unwrap();
         assert_eq!(decode_oplog_file(&raw), vec!["entry\n".to_string()]);
-        assert!(queued_file(&op_log).tail_verified, "a successful write leaves the tail verified");
+        assert!(
+            queued_file(&op_log).tail_verified,
+            "a successful write leaves the tail verified"
+        );
 
         // a failure AFTER a success: a directory in place of the log file
         // fails the write on every platform; the failure must invalidate
@@ -668,16 +740,33 @@ mod tests {
         std::fs::create_dir(&file).unwrap();
         op_log.log("test", Utc::now(), "later");
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 1, "a failed write must keep the entry queued");
-        assert!(!queued_file(&op_log).tail_verified, "a failed write must invalidate the tail check");
+        assert_eq!(
+            op_log.log_count(),
+            1,
+            "a failed write must keep the entry queued"
+        );
+        assert!(
+            !queued_file(&op_log).tail_verified,
+            "a failed write must invalidate the tail check"
+        );
 
         std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, &raw).unwrap();
         op_log.write_to_files().await;
-        assert_eq!(op_log.log_count(), 0, "the first successful write must drain the queue");
-        assert!(queued_file(&op_log).tail_verified, "a successful write leaves the tail verified");
+        assert_eq!(
+            op_log.log_count(),
+            0,
+            "the first successful write must drain the queue"
+        );
+        assert!(
+            queued_file(&op_log).tail_verified,
+            "a successful write leaves the tail verified"
+        );
         let raw = std::fs::read(&file).unwrap();
-        assert_eq!(decode_oplog_file(&raw), vec!["entry\n".to_string(), "later\n".to_string()]);
+        assert_eq!(
+            decode_oplog_file(&raw),
+            vec!["entry\n".to_string(), "later\n".to_string()]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -714,7 +803,10 @@ mod tests {
         op_log.flush().await;
         let clean = std::fs::read(&path).unwrap();
         let frame2 = clean.len() as u64 - len1;
-        assert!(frame2 > 16_384, "the second frame must need a three-byte size field: {frame2}");
+        assert!(
+            frame2 > 16_384,
+            "the second frame must need a three-byte size field: {frame2}"
+        );
 
         // bytes of the second frame kept on disk — the whole frame (no cut),
         // 1..=4 (cut inside the prefix: marker, rnd, checksum, size), and
@@ -765,9 +857,21 @@ mod tests {
         assert_eq!(walk(b""), None);
         assert_eq!(walk(b"plain text, not a log\n"), None);
         assert_eq!(walk(magic), None, "magic only: nothing to cut");
-        assert_eq!(walk(&[magic, b"XYZ"].concat()), None, "bad marker: not ours to judge");
-        assert_eq!(walk(&[magic, frame].concat()), None, "complete frame: nothing to cut");
-        assert_eq!(walk(&[magic, frame, frame].concat()), None, "two complete frames");
+        assert_eq!(
+            walk(&[magic, b"XYZ"].concat()),
+            None,
+            "bad marker: not ours to judge"
+        );
+        assert_eq!(
+            walk(&[magic, frame].concat()),
+            None,
+            "complete frame: nothing to cut"
+        );
+        assert_eq!(
+            walk(&[magic, frame, frame].concat()),
+            None,
+            "two complete frames"
+        );
         assert_eq!(
             walk(&[magic, frame, b"garbage"].concat()),
             None,
@@ -801,8 +905,16 @@ mod tests {
                 }
             }
             big.extend(std::iter::repeat_n(0x55u8, size));
-            assert_eq!(walk(&[magic, &big].concat()), None, "complete {size}-byte frame");
-            assert_eq!(walk(&[magic, &big, frame].concat()), None, "followed by a complete frame");
+            assert_eq!(
+                walk(&[magic, &big].concat()),
+                None,
+                "complete {size}-byte frame"
+            );
+            assert_eq!(
+                walk(&[magic, &big, frame].concat()),
+                None,
+                "followed by a complete frame"
+            );
             assert_eq!(
                 walk(&[magic, frame, &big[..big.len() - 1]].concat()),
                 Some((magic.len() + frame.len()) as u64),
@@ -829,7 +941,11 @@ mod tests {
         let len = content.len() as u64;
 
         super::cut_interrupted_tail_up_to(&path, len - 1).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "above the cap: untouched");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "above the cap: untouched"
+        );
 
         super::cut_interrupted_tail_up_to(&path, len).unwrap();
         assert_eq!(
@@ -894,24 +1010,43 @@ mod tests {
         let random_like: VecDeque<String> = VecDeque::from([hard_to_compress]);
 
         for level in 0..=9u32 {
-            for (label, logs) in [("short", &short), ("repetitive", &repetitive), ("random-like", &random_like)] {
-                let (prefix, payload, consumed) =
-                    super::encode_frame(logs, Some("a header"), Some("a backlog notice"), Compression::new(level))
-                        .unwrap_or_else(|e| panic!("level {level}, {label}: encode failed: {e}"));
-                assert_eq!(consumed, logs.len(), "level {level}, {label}: every entry must be consumed");
+            for (label, logs) in [
+                ("short", &short),
+                ("repetitive", &repetitive),
+                ("random-like", &random_like),
+            ] {
+                let (prefix, payload, consumed) = super::encode_frame(
+                    logs,
+                    Some("a header"),
+                    Some("a backlog notice"),
+                    Compression::new(level),
+                )
+                .unwrap_or_else(|e| panic!("level {level}, {label}: encode failed: {e}"));
+                assert_eq!(
+                    consumed,
+                    logs.len(),
+                    "level {level}, {label}: every entry must be consumed"
+                );
 
                 let mut raw = super::MAGIC.to_vec();
                 raw.extend_from_slice(&prefix);
                 raw.extend_from_slice(&payload);
 
                 let decoded = decode_oplog_file(&raw);
-                assert_eq!(decoded.len(), 1, "level {level}, {label}: one entry was written as one frame");
+                assert_eq!(
+                    decoded.len(),
+                    1,
+                    "level {level}, {label}: one entry was written as one frame"
+                );
                 let mut expected = String::from("a header\na backlog notice\n");
                 for log in logs {
                     expected.push_str(log);
                     expected.push('\n');
                 }
-                assert_eq!(decoded[0], expected, "level {level}, {label}: decoded text must match what was written");
+                assert_eq!(
+                    decoded[0], expected,
+                    "level {level}, {label}: decoded text must match what was written"
+                );
             }
         }
     }

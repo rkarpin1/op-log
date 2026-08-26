@@ -14,8 +14,8 @@ impl OpLogWorker {
         });
 
         self.definitions.retain(|_, d| {
-            !d.auto_remove_definition ||
-                (!d.files.is_empty() || d.last_time_use.elapsed() < Duration::from_secs(10 * 60))
+            !d.auto_remove_definition
+                || (!d.files.is_empty() || d.last_time_use.elapsed() < Duration::from_secs(10 * 60))
         });
     }
 }
@@ -65,7 +65,11 @@ mod tests {
             "a definition without auto_remove_definition must survive an idle period"
         );
         worker.log("quiet", Utc::now(), "first entry after a quiet period");
-        assert_eq!(queued_entries(&worker, "quiet"), 1, "entry must be queued, not dropped");
+        assert_eq!(
+            queued_entries(&worker, "quiet"),
+            1,
+            "entry must be queued, not dropped"
+        );
     }
 
     // `auto_remove_definition(true)` opts into the idle cleanup: the definition

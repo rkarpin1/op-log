@@ -39,7 +39,6 @@ impl log::Log for OpLogSystemLogger {
     }
 
     fn log(&self, record: &log::Record<'_>) {
-
         if record.level() > log::Level::Info {
             return;
         }
