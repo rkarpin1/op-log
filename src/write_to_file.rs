@@ -916,3 +916,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bench.rs"]
+mod bench;
