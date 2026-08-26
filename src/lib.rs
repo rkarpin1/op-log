@@ -187,11 +187,18 @@ impl OpLog {
         let name = def.log_name.clone();
         self.def(def);
 
+        // `set_boxed_logger`, not `set_logger(Box::leak(..))`: the global
+        // logger can only be installed once per process, and leaking before
+        // knowing whether this call won would keep the logger — and with it
+        // an `Arc<OpLogInner>`, its sender, and therefore the worker task —
+        // alive for the rest of the process, even after every `OpLog` handle
+        // is dropped. `set_boxed_logger` only leaks once the install has
+        // succeeded, so a losing call frees what it built.
         let logger = Box::new(OpLogSystemLogger {
             inner: self.0.clone(),
             name,
         });
-        if log::set_logger(Box::leak(logger)).is_ok() {
+        if log::set_boxed_logger(logger).is_ok() {
             log::set_max_level(log::LevelFilter::Trace);
         }
 
@@ -377,6 +384,24 @@ mod tests {
         let info = op.get_info().await.unwrap();
         assert_eq!(info.number_of_definitions, 1);
         assert!(info.number_of_logs >= 1, "info! must route to OpLog");
+
+        // The global logger can only be installed once per process, so this
+        // second call loses — and a losing call must release the logger it
+        // built rather than keep it. That logger holds an `Arc<OpLogInner>`,
+        // which holds the sender, which would keep the worker task alive for
+        // the rest of the process even after every handle is dropped.
+        //
+        // This lives here, rather than in a test of its own, because only
+        // one test may install the global logger: a second installer would
+        // race this one for it and make whichever lost fail.
+        let references_before = std::sync::Arc::strong_count(&op.0);
+        op.def_system_log(OpLogDefinition::new("log", dir.to_str().unwrap()));
+        assert_eq!(
+            std::sync::Arc::strong_count(&op.0),
+            references_before,
+            "a call that could not install the logger must release it, \
+             not hold the worker alive"
+        );
 
         op.shutdown().await;
 
