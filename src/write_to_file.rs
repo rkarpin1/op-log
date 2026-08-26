@@ -255,6 +255,24 @@ impl OpLogWorker {
     }
 }
 
+/// Seeds the obfuscation keystream from a frame's random byte and the
+/// length of its payload — the same two values, and the same arithmetic, a
+/// reader has to use to recompute the stream.
+///
+/// The product wraps deliberately. Only the low 12 bits survive the mask,
+/// and both the wrap (modulo 2^32) and the truncation of `size` to `u32`
+/// preserve those bits, so the result equals the low bits of the full
+/// product — which is what a reader computing in arbitrary precision, such
+/// as the Python decoder, arrives at. Written as a plain `*` it instead
+/// panics in a debug build once `rnd * size` passes `u32::MAX`, which a
+/// payload beyond ~16.8 MB reaches: the 2 MB cap ends the chunking loop but
+/// never splits a single entry, so one very large log entry gets there. A
+/// panic in the worker task ends logging until the process restarts, and
+/// the value it would have computed in release is the wrapped one anyway.
+fn xor_seed(rnd: u8, size: usize) -> u32 {
+    (rnd as u32).wrapping_mul(size as u32) & 0xFFF
+}
+
 /// Compresses `header` (a new file's first frame only), `notice` (a
 /// dropped-backlog notice, if any) and as many of `logs` as fit — chunked
 /// the same way production does, up to 64 000 B per `write_all` into the
@@ -316,7 +334,7 @@ fn encode_frame(
     let rnd: u8 = random();
 
     let mut sum = 0u32;
-    let mut xor: u32 = (rnd as u32 * size as u32) & 0xFFF;
+    let mut xor: u32 = xor_seed(rnd, size);
 
     // encrypt
     for byte in a.iter_mut() {
@@ -1046,6 +1064,35 @@ mod tests {
                 assert_eq!(
                     decoded[0], expected,
                     "level {level}, {label}: decoded text must match what was written"
+                );
+            }
+        }
+    }
+
+    // The keystream seed must equal the low bits of `rnd * size` for any
+    // payload length — that is what a reader recomputes, in arithmetic that
+    // never overflows — and it must arrive there without panicking on the
+    // sizes where a `u32` product does not fit. Sizes past ~16.8 MB are
+    // reachable with a single log entry that large: the 2 MB cap ends the
+    // chunking loop but never splits one entry.
+    #[test]
+    fn the_keystream_seed_survives_payloads_too_large_for_a_u32_product() {
+        let reference = |rnd: u8, size: usize| ((rnd as u128 * size as u128) & 0xFFF) as u32;
+
+        for size in [
+            0usize,
+            1,
+            64_000,
+            2 * 1024 * 1024,
+            16_843_010,                // rnd = 255 overflows a u32 product from here
+            21_700_000,                // measured: a 40 MB entry compresses to about this
+            u32::MAX as usize + 12345, // `size as u32` truncates, mask still agrees
+        ] {
+            for rnd in [0u8, 1, 128, 199, 254, 255] {
+                assert_eq!(
+                    super::xor_seed(rnd, size),
+                    reference(rnd, size),
+                    "seed for rnd={rnd}, size={size} must match the full product's low bits"
                 );
             }
         }
