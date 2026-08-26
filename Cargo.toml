@@ -9,7 +9,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4.40" }
 chrono-tz = "0.10"
-flate2 = { version = "1", features = ["zlib-rs"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rand = "0.10"
 log = "0.4"
 [dev-dependencies]
