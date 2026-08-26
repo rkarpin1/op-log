@@ -430,6 +430,8 @@ mod tests {
     use crate::OpLogWorker;
     use crate::messages::{OpLogDefinition, OpLogType};
     use chrono::Utc;
+    use flate2::Compression;
+    use std::collections::VecDeque;
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -859,5 +861,58 @@ mod tests {
             "timeout must interrupt an operation that never completes, \
              otherwise the worker hangs forever"
         );
+    }
+
+    // Every zlib level (0 = store, 9 = best compression) must round-trip
+    // through the frame `encode_frame` builds: the VLQ size prefix and the
+    // XOR keystream depend on the compressed payload's length, which varies
+    // with the level, so a bug at one length wouldn't necessarily show at
+    // another. Three corpora exercise different compressed-size regimes:
+    // a short entry set (production's common case), a long, highly
+    // repetitive entry (small output even at level 0), and a long entry
+    // with little redundancy (output close to input size at every level).
+    #[test]
+    fn every_zlib_level_round_trips_through_the_frame() {
+        let short: VecDeque<String> = ["first entry", "second entry", "third, with more text"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let repetitive: VecDeque<String> =
+            VecDeque::from([format!("{} ", "same word ").repeat(20_000)]);
+
+        // A linear congruential generator gives a deterministic, hard-to-
+        // compress byte stream without pulling in a `rand` distribution.
+        let mut state = 88172645463325252u64;
+        let mut hard_to_compress = String::with_capacity(50_000);
+        while hard_to_compress.len() < 50_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            hard_to_compress.push_str(&format!("{:016x}", state));
+        }
+        let random_like: VecDeque<String> = VecDeque::from([hard_to_compress]);
+
+        for level in 0..=9u32 {
+            for (label, logs) in [("short", &short), ("repetitive", &repetitive), ("random-like", &random_like)] {
+                let (prefix, payload, consumed) =
+                    super::encode_frame(logs, Some("a header"), Some("a backlog notice"), Compression::new(level))
+                        .unwrap_or_else(|e| panic!("level {level}, {label}: encode failed: {e}"));
+                assert_eq!(consumed, logs.len(), "level {level}, {label}: every entry must be consumed");
+
+                let mut raw = super::MAGIC.to_vec();
+                raw.extend_from_slice(&prefix);
+                raw.extend_from_slice(&payload);
+
+                let decoded = decode_oplog_file(&raw);
+                assert_eq!(decoded.len(), 1, "level {level}, {label}: one entry was written as one frame");
+                let mut expected = String::from("a header\na backlog notice\n");
+                for log in logs {
+                    expected.push_str(log);
+                    expected.push('\n');
+                }
+                assert_eq!(decoded[0], expected, "level {level}, {label}: decoded text must match what was written");
+            }
+        }
     }
 }
