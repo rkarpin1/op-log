@@ -120,7 +120,7 @@ log.clean_up_definition(OpLogCleanUpDefinition {
 });
 ```
 
-The worker runs cleanup every 5 minutes, deleting files (and empty directories) older than the specified number of days. One cleanup pass is cut off after 60 seconds (it runs in the same task as the writer, so it must never hang it); a cut-off pass starts over on the next tick.
+The worker runs cleanup every 5 minutes, deleting files (and empty directories) older than the specified number of days. **Age counts from the last write, not from creation**, so a log still being appended to is never deleted, however long ago it was created — this matters for `NoSplit` and `PerMonth`, where one file stays in use for longer than the retention period. On a filesystem that reports no modification time the creation time stands in; a file that can be dated by neither is never deleted. One cleanup pass is cut off after 60 seconds (it runs in the same task as the writer, so it must never hang it); a cut-off pass starts over on the next tick.
 
 ## File format
 

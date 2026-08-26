@@ -5,7 +5,6 @@
 use crate::messages::OpLogCleanUpDefinition;
 use crate::OpLogWorker;
 use log::info;
-use std::cmp::min;
 use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -23,6 +22,28 @@ use tokio::time::timeout;
 /// over on the next cleanup tick — deleting is idempotent and every partial
 /// pass has already removed something, so it converges.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Decides whether a file has gone unwritten for `min_days` whole days.
+///
+/// Age is measured from the LAST MODIFICATION, so a file that is still
+/// being appended to is never old, however long ago it was created. The
+/// creation time is only a fallback for filesystems that do not report a
+/// modification time; when neither is available the file counts as brand
+/// new, because cleanup must not delete a file it cannot date.
+///
+/// The timestamps and `now` are arguments rather than reads of the file and
+/// the clock so that the rule can be pinned by a test on every platform:
+/// modification times can be set portably, creation times cannot.
+fn is_older_than(
+    modified: io::Result<SystemTime>,
+    created: io::Result<SystemTime>,
+    now: SystemTime,
+    min_days: u32,
+) -> bool {
+    let time = modified.or(created).unwrap_or(now);
+    let duration = now.duration_since(time).unwrap_or(Duration::from_secs(0));
+    duration.as_secs() / (60 * 60 * 24) >= min_days as u64
+}
 
 /// Runs one cleanup pass under `CLEANUP_TIMEOUT`; returns whether it
 /// completed.
@@ -72,18 +93,12 @@ impl OpLogWorker {
 
     async fn is_for_deletion(&self, dir_entry: &DirEntry, min_days: u32) -> io::Result<bool> {
         let metadata = dir_entry.metadata().await?;
-
-        let modified_time = metadata.modified().unwrap_or(SystemTime::now());
-        let created_time = metadata.created().unwrap_or(SystemTime::now());
-
-        let time = min(modified_time, created_time);
-
-        let duration = SystemTime::now()
-            .duration_since(time)
-            .unwrap_or(Duration::from_secs(0));
-
-        let days = duration.as_secs() / (60 * 60 * 24);
-        Ok(days >= min_days as u64)
+        Ok(is_older_than(
+            metadata.modified(),
+            metadata.created(),
+            SystemTime::now(),
+            min_days,
+        ))
     }
 
     async fn delete_files_in_path(&self, path: &Path, delete_after_days: u32) {
@@ -146,6 +161,8 @@ impl OpLogWorker {
 #[cfg(test)]
 mod tests {
     use super::OpLogWorker;
+    use std::time::SystemTime;
+    use tokio::io;
     use std::ffi::OsString;
     use std::time::Duration;
 
@@ -228,5 +245,81 @@ mod tests {
         assert!(worker.cleanup_timed_out, "a repeated cut-off keeps the episode open");
         worker.note_cleanup_outcome(true);
         assert!(!worker.cleanup_timed_out, "a completed pass closes the episode");
+    }
+
+    // Retention counts days since the file was last WRITTEN, not since it
+    // was created: a `NoSplit` log created months ago but appended to today
+    // is not old. The creation time only stands in when the filesystem
+    // reports no modification time, and a file that can be dated by neither
+    // is never deleted.
+    #[test]
+    fn retention_age_is_measured_from_the_last_modification() {
+        let now = SystemTime::now();
+        let days_ago = |d: u64| Ok(now - Duration::from_secs(d * 24 * 60 * 60));
+        let unavailable = || Err(io::Error::other("no timestamp on this filesystem"));
+
+        assert!(
+            !super::is_older_than(days_ago(0), days_ago(400), now, 30),
+            "a file created long ago but written to today must survive"
+        );
+        assert!(
+            super::is_older_than(days_ago(40), days_ago(0), now, 30),
+            "a file left unwritten for 40 days is old, however recently it was created"
+        );
+        assert!(
+            super::is_older_than(days_ago(30), days_ago(30), now, 30),
+            "the threshold counts whole days and is inclusive"
+        );
+        assert!(
+            !super::is_older_than(days_ago(29), days_ago(29), now, 30),
+            "a day short of the threshold is not old yet"
+        );
+        assert!(
+            super::is_older_than(unavailable(), days_ago(40), now, 30),
+            "without a modification time the creation time decides"
+        );
+        assert!(
+            !super::is_older_than(unavailable(), unavailable(), now, 30),
+            "a file that cannot be dated must never be deleted"
+        );
+        assert!(
+            !super::is_older_than(Ok(now + Duration::from_secs(3600)), days_ago(400), now, 30),
+            "a modification time in the future must not underflow into a huge age"
+        );
+    }
+
+    // The rule above has to be the one the cleaner actually applies: this
+    // walks a real directory, so a future change reading the creation time
+    // again would show up here. Only modification times are set — creation
+    // times cannot be set portably, which is why the rule itself is pinned
+    // by the truth table above.
+    #[tokio::test]
+    async fn cleaner_deletes_by_modification_time() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let worker = OpLogWorker::new(rx);
+
+        let dir = std::env::temp_dir().join(format!("op-log-retention-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let stale = dir.join("stale.log");
+        let active = dir.join("active.log");
+        for path in [&stale, &active] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        // Both files were just created; only their modification times differ.
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60))
+            .unwrap();
+
+        worker.delete_files_in_path(&dir, 30).await;
+
+        assert!(!stale.exists(), "a file unwritten for 40 days must be deleted at 30");
+        assert!(active.exists(), "a file written just now must survive, though it is as new as the other");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
