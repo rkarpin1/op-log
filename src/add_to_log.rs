@@ -4,18 +4,70 @@
 
 use crate::{LogDefinition, LogFile, OpLogWorker};
 use crate::messages::{OpLogDefinition, OpLogOption, OpLogType};
+use chrono::format::{Fixed, Item, Numeric, Pad};
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Warsaw;
 use chrono_tz::Tz;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use tokio::time::Instant;
 
-fn format_date_in_log<'a>(log_type: &OpLogType) -> &'a str {
+// The date formats below are the `strftime` strings "%H:%M:%S.%3f",
+// "%d %H:%M:%S.%3f", "%Y_%m_%d_%H", "%Y_%m_%d" and "%Y_%m", already parsed
+// into chrono's items. chrono parses a format string on every call, and
+// that parse (twice per entry: the timestamp and the file period) was a
+// quarter of the worker's cost per entry. The output is the same byte for
+// byte; `Fixed::Nanosecond3` prints the dot that "%3f" leaves to the
+// literal before it.
+const TIME_IN_LOG: &[Item<'static>] = &[
+    Item::Numeric(Numeric::Hour, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Numeric::Minute, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Numeric::Second, Pad::Zero),
+    Item::Fixed(Fixed::Nanosecond3),
+];
+
+const DAY_AND_TIME_IN_LOG: &[Item<'static>] = &[
+    Item::Numeric(Numeric::Day, Pad::Zero),
+    Item::Space(" "),
+    Item::Numeric(Numeric::Hour, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Numeric::Minute, Pad::Zero),
+    Item::Literal(":"),
+    Item::Numeric(Numeric::Second, Pad::Zero),
+    Item::Fixed(Fixed::Nanosecond3),
+];
+
+const HOUR_IN_PATH: &[Item<'static>] = &[
+    Item::Numeric(Numeric::Year, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Month, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Day, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Hour, Pad::Zero),
+];
+
+const DAY_IN_PATH: &[Item<'static>] = &[
+    Item::Numeric(Numeric::Year, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Month, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Day, Pad::Zero),
+];
+
+const MONTH_IN_PATH: &[Item<'static>] = &[
+    Item::Numeric(Numeric::Year, Pad::Zero),
+    Item::Literal("_"),
+    Item::Numeric(Numeric::Month, Pad::Zero),
+];
+
+fn format_date_in_log(log_type: &OpLogType) -> &'static [Item<'static>] {
     match log_type {
-        OpLogType::NoSplit => "",
-        OpLogType::PerHour => "%H:%M:%S.%3f",
-        OpLogType::PerDay => "%H:%M:%S.%3f",
-        OpLogType::PerMonth => "%d %H:%M:%S.%3f",
+        OpLogType::NoSplit => &[],
+        OpLogType::PerHour => TIME_IN_LOG,
+        OpLogType::PerDay => TIME_IN_LOG,
+        OpLogType::PerMonth => DAY_AND_TIME_IN_LOG,
     }
 }
 
@@ -53,16 +105,16 @@ pub(crate) fn format_entry(
 
 /// Appends `date` formatted with `format` to `out`. The formats used here
 /// are constants without an error item, so the formatting cannot fail.
-fn write_date(out: &mut String, date: &DateTime<Tz>, format: &str) {
-    date.format(format).write_to(out).expect("constant date format")
+fn write_date(out: &mut String, date: &DateTime<Tz>, format: &[Item<'static>]) {
+    date.format_with_items(format.iter()).write_to(out).expect("constant date format")
 }
 
-fn format_date_in_path<'a>(log_type: &OpLogType) -> &'a str {
+fn format_date_in_path(log_type: &OpLogType) -> &'static [Item<'static>] {
     match log_type {
-        OpLogType::NoSplit => "",
-        OpLogType::PerHour => "%Y_%m_%d_%H",
-        OpLogType::PerDay => "%Y_%m_%d",
-        OpLogType::PerMonth => "%Y_%m",
+        OpLogType::NoSplit => &[],
+        OpLogType::PerHour => HOUR_IN_PATH,
+        OpLogType::PerDay => DAY_IN_PATH,
+        OpLogType::PerMonth => MONTH_IN_PATH,
     }
 }
 
