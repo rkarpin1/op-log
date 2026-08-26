@@ -11,6 +11,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::random;
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::io;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
@@ -245,6 +246,103 @@ impl OpLogWorker {
     }
 }
 
+/// Compresses `header` (a new file's first frame only), `notice` (a
+/// dropped-backlog notice, if any) and as many of `logs` as fit — chunked
+/// the same way production does, up to 64 000 B per `write_all` into the
+/// encoder and a 2 MB cap on the compressed payload — then obfuscates the
+/// result and prefixes it with the frame header (marker, random byte,
+/// checksum, VLQ size): the inverse of `truncated_frame_start`'s prefix
+/// parsing. Returns the prefix, the payload, and how many entries were
+/// consumed, so the caller can drain exactly those from `logs` once the
+/// write to disk succeeds.
+///
+/// Pulled out of `write_to_file` so the framing can be exercised at any
+/// compression level in a test; production always calls it with
+/// `Compression::default()`.
+fn encode_frame(
+    logs: &VecDeque<String>,
+    header: Option<&str>,
+    notice: Option<&str>,
+    level: Compression,
+) -> io::Result<(Vec<u8>, Vec<u8>, usize)> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+    let mut encoder = ZlibEncoder::new(Vec::new(), level);
+
+    if let Some(header) = header {
+        encoder.write_all(header.as_bytes())?;
+        encoder.write_all(b"\n")?;
+    }
+    if let Some(notice) = notice {
+        encoder.write_all(notice.as_bytes())?;
+        encoder.write_all(b"\n")?;
+    }
+
+    let mut consumed = 0usize;
+    loop {
+        bytes.clear();
+
+        while let Some(log) = logs.get(consumed) {
+            bytes.extend_from_slice(log.as_bytes());
+            bytes.push(0x0a);
+            consumed += 1;
+
+            if bytes.len() > 64000 {
+                break;
+            }
+        }
+
+        if bytes.is_empty() {
+            break;
+        }
+
+        encoder.write_all(&bytes)?;
+        if encoder.get_ref().len() > 2 * 1024 * 1024 {
+            break;
+        }
+    }
+
+    let mut a = encoder.finish()?;
+    let mut size = a.len();
+
+    let rnd: u8 = random();
+
+    let mut sum = 0u32;
+    let mut xor: u32 = (rnd as u32 * size as u32) & 0xFFF;
+
+    // encrypt
+    for byte in a.iter_mut() {
+        sum += *byte as u32;
+        sum &= 0xff;
+
+        xor *= 2903;
+        xor += 71;
+
+        xor &= 0xfff;
+
+        *byte ^= (xor & 0xff) as u8;
+    }
+
+    let mut prefix = Vec::with_capacity(8);
+    prefix.push(0xff);
+    prefix.push(rnd);
+    prefix.push((sum as u8) ^ 0x5c);
+
+    loop {
+        let mut b: u8 = (size & 0x7F) as u8;
+        size >>= 7;
+        if size != 0 {
+            b |= 0x80
+        };
+
+        prefix.push(b ^ 0xc5);
+        if size == 0 {
+            break;
+        }
+    }
+
+    Ok((prefix, a, consumed))
+}
+
 impl LogFile {
     async fn write_to_file(
         &mut self,
@@ -262,9 +360,6 @@ impl LogFile {
                 return Ok(());
             }
         }
-
-        let mut bytes: Vec<u8> = Vec::with_capacity(1024);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
 
         let mut path = PathBuf::from(&self.path);
         let _ = create_dir_all(&path).await;
@@ -291,96 +386,24 @@ impl LogFile {
             File::options().append(true).open(&path).await?
         } else {
             let mut f = File::create(&path).await?;
-
             f.write_all(MAGIC).await?;
-
-            if !self.header.is_empty() {
-                encoder.write_all(self.header.as_bytes())?;
-                encoder.write_all(b"
-")?;
-            }
-
             f
         };
 
         // Encode by INDEX, not by draining `self.logs` — the disk write below
         // can still be interrupted by the caller's `tokio::time::timeout`. If
         // entries were popped here, a timed-out write would lose them for
-        // good (they'd exist only in `bytes`/`encoder`, dropped with the
-        // future). Only remove what was actually written once the write
-        // below has succeeded (see `self.logs.drain(..consumed)` further
-        // down) — a timeout before that point leaves `self.logs` untouched,
-        // so the next tick retries the same entries in full.
-        if let Some(notice) = backlog_notice {
-            encoder.write_all(notice.as_bytes())?;
-            encoder.write_all(b"\n")?;
-        }
+        // good (they'd exist only in the encoder, dropped with the future).
+        // Only remove what was actually written once the write below has
+        // succeeded (see `self.logs.drain(..consumed)` further down) — a
+        // timeout before that point leaves `self.logs` untouched, so the
+        // next tick retries the same entries in full.
+        let header = (!has_content && !self.header.is_empty()).then_some(self.header.as_str());
+        let (prefix, payload, consumed) =
+            encode_frame(&self.logs, header, backlog_notice, Compression::default())?;
 
-        let mut consumed = 0usize;
-        loop {
-            bytes.clear();
-
-            while let Some(log) = self.logs.get(consumed) {
-                bytes.extend_from_slice(log.as_bytes());
-                bytes.push(0x0a);
-                consumed += 1;
-
-                if bytes.len() > 64000 {
-                    break;
-                }
-            }
-
-            if bytes.is_empty() {
-                break;
-            }
-
-            encoder.write_all(&bytes)?;
-            if encoder.get_ref().len() > 2 * 1024 * 1024 {
-                break;
-            }
-        }
-
-        let mut a = encoder.finish()?;
-        let mut size = a.len();
-
-        let rnd: u8 = random();
-
-        let mut sum = 0u32;
-        let mut xor: u32 = (rnd as u32 * size as u32) & 0xFFF;
-
-        // encrypt
-        for byte in a.iter_mut() {
-            sum += *byte as u32;
-            sum &= 0xff;
-
-            xor *= 2903;
-            xor += 71;
-
-            xor &= 0xfff;
-
-            *byte ^= (xor & 0xff) as u8;
-        }
-
-        bytes.clear();
-        bytes.push(0xff);
-        bytes.push(rnd);
-        bytes.push((sum as u8) ^ 0x5c);
-
-        loop {
-            let mut a: u8 = (size & 0x7F) as u8;
-            size >>= 7;
-            if size != 0 {
-                a |= 0x80
-            };
-
-            bytes.push(a ^ 0xc5);
-            if size == 0 {
-                break;
-            }
-        }
-
-        f.write_all(&bytes).await?;
-        f.write_all(&a).await?;
+        f.write_all(&prefix).await?;
+        f.write_all(&payload).await?;
         f.flush().await?;
 
         // Only now, after the write is confirmed on disk, drop the entries
